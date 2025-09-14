@@ -8,7 +8,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap, Cell};
+use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap, Cell, Clear};
 use ratatui::Terminal;
 use std::collections::HashMap;
 use std::fs;
@@ -65,6 +65,8 @@ struct App {
     update_rx: Option<Receiver<Vec<RowItem>>>,
     fs_ping_rx: Option<Receiver<()>>,
     watcher_enabled: bool,
+    // info modal
+    show_info_modal: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +109,7 @@ impl App {
                 update_rx: None,
                 fs_ping_rx: if watch_pref { spawn_initial_fs_watcher(&projects_dir) } else { None },
                 watcher_enabled: watch_pref,
+                show_info_modal: false,
             };
             if let Some(fp) = filter_pref { app.set_filter(Some(fp)); }
             return Ok(app);
@@ -156,6 +159,7 @@ impl App {
             update_rx: None,
             fs_ping_rx: ping_rx,
             watcher_enabled: watch_pref,
+            show_info_modal: false,
         };
         if let Some(fp) = filter_pref.clone() { app.set_filter(Some(fp)); } else { app.set_filter(None); }
         apply_sort(&mut app);
@@ -289,7 +293,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let footer_text = if app.list_search_input {
         format!("/{}  — Enter run  Esc cancel", app.list_search_query)
     } else {
-        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   f filter cwd   / search   s sort key   o order   e export   x clear   q quit ".to_string()
+        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   f filter cwd   / search   s sort key   o order   e export   i info   x clear   q quit ".to_string()
     };
     let footer = Paragraph::new(Line::from(Span::styled(footer_text, Style::default().fg(Color::White).bg(Color::Blue))));
     f.render_widget(footer, chunks[3]);
@@ -429,6 +433,80 @@ fn export_html(title: &str, cwd: &str, msgs: &[Message]) -> Result<std::path::Pa
     Ok(file)
 }
 
+fn render_info_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    if app.rows.is_empty() || app.selected >= app.rows.len() {
+        return;
+    }
+
+    let selected_row = &app.rows[app.selected];
+    
+    // Get detailed message info
+    let message_count = if let Some(messages) = app.messages_cache.get(&selected_row.id) {
+        messages.len()
+    } else {
+        0 // Unknown, not loaded yet
+    };
+
+    // Create modal popup area (centered, 60% width, 70% height)
+    let popup_area = Rect {
+        x: area.width / 5,
+        y: area.height / 6,
+        width: (area.width * 3) / 5,
+        height: (area.height * 2) / 3,
+    };
+
+    // Clear the area first
+    f.render_widget(Clear, popup_area);
+    
+    // Create the modal content
+    let created_date = if let Some(ts) = selected_row.date_ms.checked_div(1000) {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "Unknown".to_string())
+    } else {
+        "Unknown".to_string()
+    };
+
+    let last_msg_date = if let Some(ts) = selected_row.last_msg_ms.and_then(|ms| ms.checked_div(1000)) {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "Unknown".to_string())
+    } else {
+        "Unknown".to_string()
+    };
+
+    let info_text = format!(
+        "Session Information\n\
+        \n\
+        ID: {}\n\
+        Path: {}\n\
+        File: {}\n\
+        Created: {}\n\
+        Last Message: {}\n\
+        Message Count: {}\n\
+        \n\
+        Press ESC to close",
+        selected_row.id,
+        if selected_row.path.is_empty() { "Not set" } else { &selected_row.path },
+        selected_row.file_path,
+        created_date,
+        last_msg_date,
+        if message_count > 0 { message_count.to_string() } else { "Not loaded".to_string() }
+    );
+
+    let modal = Paragraph::new(info_text)
+        .block(
+            Block::default()
+                .title(" Session Info ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+        )
+        .wrap(Wrap { trim: true })
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    f.render_widget(modal, popup_area);
+}
+
 fn main() -> Result<()> {
     // Optional override for projects directory
     let args: Vec<String> = std::env::args().collect();
@@ -539,6 +617,9 @@ fn main() -> Result<()> {
         terminal.draw(|f| {
             let size = f.size();
             match app.mode { Mode::List => render_list(f, size, &app), Mode::View => render_view(f, size, &app) }
+            if app.show_info_modal {
+                render_info_modal(f, size, &app);
+            }
         })?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -550,8 +631,9 @@ fn main() -> Result<()> {
                             // Quit
                             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => break,
                             KeyCode::Char('q') if !app.list_search_input => break,
-                            // Cancel search input (do not quit)
+                            // Cancel search input or close info modal (do not quit)
                             KeyCode::Esc if app.list_search_input => { app.list_search_input = false; },
+                            KeyCode::Esc if app.show_info_modal => { app.show_info_modal = false; },
                             KeyCode::Char('s') => { cycle_sort_key(&mut app); let _ = save_sort_prefs(app.sort_key, app.sort_desc); spawn_sort(&mut app); },
                             KeyCode::Char('o') => { app.sort_desc = !app.sort_desc; let _ = save_sort_prefs(app.sort_key, app.sort_desc); spawn_sort(&mut app); },
                             KeyCode::Char('w') => {
@@ -563,6 +645,7 @@ fn main() -> Result<()> {
                                 }
                                 let _ = save_watcher_pref(app.watcher_enabled);
                             },
+                            KeyCode::Char('i') if !app.list_search_input => { app.show_info_modal = true; },
                             KeyCode::Char('/') => { app.list_search_input = true; app.list_search_query.clear(); },
                             KeyCode::Enter if app.list_search_input => { spawn_list_search(&mut app); app.list_search_input = false; },
                             KeyCode::Backspace if app.list_search_input => { app.list_search_query.pop(); },

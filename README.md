@@ -43,6 +43,11 @@ It reads session logs from `~/.claude/projects/**/<sessionId>.jsonl`, presents a
   - Empty tool results omitted (no stray headers)
   - Edit tool (name `Edit`) parsed specially: shows unified diff between `old_string` and `new_string` with `diff` code fence
 
+- Session info modal
+  - Press `i` to view detailed information about the selected conversation
+  - Shows session ID, project path, file path, creation date, last message date, and message count
+  - Modal appears as an overlay and can be closed with `Esc`
+
 - Export
   - Export current conversation to `exports/conversation-<id>.html` (`e`) and open in default browser
   - Tool results are collapsed in `<details>` sections to keep pages readable
@@ -85,6 +90,7 @@ List view:
 - w: toggle file watcher (live updates)
 - s: cycle sort key (created → path → last‑message)
 - o: toggle sort order (asc/desc)
+- i: show session info modal
 - e: export to HTML and open
 - q: quit (only when not typing a search)
 
