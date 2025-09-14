@@ -26,6 +26,7 @@ It reads session logs from `~/.claude/projects/**/<sessionId>.jsonl`, presents a
     - Watcher on/off (`watcher`)
     - Sort key/order (`sort_key`, `sort_desc`)
     - Current CWD filter (`filter_path`)
+    - Claude command (`claude_command`)
   - Filter by CWD (`f`), clear filter/search (`x`)
   - Sorting (async, non‑blocking):
     - Default sort: newest session first (created desc)
@@ -47,6 +48,20 @@ It reads session logs from `~/.claude/projects/**/<sessionId>.jsonl`, presents a
   - Press `i` to view detailed information about the selected conversation
   - Shows session ID, project path, file path, creation date, last message date, and message count
   - Modal appears as an overlay and can be closed with `Esc`
+
+- Settings modal
+  - Press `,` (comma) to open settings configuration
+  - Configure Claude command (defaults to "claude")
+  - Press `Enter` to edit the command, `Enter` again to save, `Esc` to cancel/close
+  - Settings persist to `~/.config/cc-history/config.json`
+
+- Session resumption
+  - Press `r` to resume the selected session in Claude Code
+  - Changes working directory to the session's project path
+  - Executes the configured Claude command with `--resume <session_id>`
+  - Supports command switches (e.g., `claude --verbose` becomes `claude --verbose --resume <session_id>`)
+  - Application exits after launching Claude (does not return to browser)
+  - Terminal state is properly restored for the launched session
 
 - Export
   - Export current conversation to `exports/conversation-<id>.html` (`e`) and open in default browser
@@ -91,6 +106,8 @@ List view:
 - s: cycle sort key (created → path → last‑message)
 - o: toggle sort order (asc/desc)
 - i: show session info modal
+- , (comma): open settings modal
+- r: resume session in Claude Code
 - e: export to HTML and open
 - q: quit (only when not typing a search)
 
