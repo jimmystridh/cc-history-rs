@@ -1,0 +1,209 @@
+name: CI and Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # Linux builds (using musl for static linking via cross)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_name: cc-history
+            asset_name: cc-history-linux-amd64
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact_name: cc-history
+            asset_name: cc-history-linux-arm64
+            use_cross: true
+          # Windows builds
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: cc-history.exe
+            asset_name: cc-history-windows-amd64
+            use_cross: false
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: cc-history.exe
+            asset_name: cc-history-windows-arm64
+            use_cross: false
+          # macOS builds
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: cc-history
+            asset_name: cc-history-macos-amd64
+            use_cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: cc-history
+            asset_name: cc-history-macos-arm64
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.86.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.86.0
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Install Cross
+        if: matrix.use_cross == true
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # --- TESTS: Regular tests on all platforms ---
+      - name: Run regular tests
+        run: cargo test --all --tests -- --nocapture
+
+      # --- TESTS: Ignored tests only on Linux ---
+      - name: Run ignored tests (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo test --all --tests -- --ignored --nocapture
+
+      # --- shared code ---------
+      - name: Set PERL for OpenSSL (Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $perl = (& where.exe perl)[0]
+          "PERL=$perl"            | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENSSL_SRC_PERL=$perl" | Out-File -FilePath $env:GITHUB_ENV -Append
+      # -------------------------
+
+      # Linux / macOS
+      - name: Install system dependencies (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      # Windows
+      - name: Build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ('${{ matrix.use_cross }}' -eq 'true') {
+            cross build --release --target '${{ matrix.target }}'
+          } else {
+            cargo build --release --target '${{ matrix.target }}'
+          }
+
+      - name: Package binary
+        shell: bash
+        run: |
+          echo "Packaging for OS: ${{ runner.os }}"
+          cd target/${{ matrix.target }}/release
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            7z a ../../../${{ matrix.asset_name }}.zip ${{ matrix.artifact_name }}
+            echo "ASSET_PATH=${{ matrix.asset_name }}.zip" >> $GITHUB_ENV
+            echo "Created ../../../${{ matrix.asset_name }}.zip"
+          else
+            tar -czf ../../../${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
+            echo "ASSET_PATH=${{ matrix.asset_name }}.tar.gz" >> $GITHUB_ENV
+            echo "Created ../../../${{ matrix.asset_name }}.tar.gz"
+          fi
+          ls ../../../ # List root directory contents for debugging
+          cd ../../../ # Go back to repo root
+
+      - name: Upload Release Asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+  create_release:
+    name: Create Release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Determine next version
+        id: determine_version
+        run: |
+          # Fetch the latest release tag using GitHub API
+          # The API requires authentication even for public repos sometimes
+          LATEST_TAG=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" | jq -r .tag_name)
+
+          # Default version if no releases found or tag is invalid
+          # Read base version from Cargo.toml as a fallback starting point
+          BASE_VERSION=$(grep '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          NEXT_VERSION=""
+
+          if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
+            echo "No previous release tag found. Using base version from Cargo.toml: $BASE_VERSION"
+            # Use the base version directly if it's the first release
+            # Or consider setting a specific first version like 0.1.0
+            NEXT_VERSION="$BASE_VERSION"
+          elif [[ "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            # Extract version parts
+            MAJOR=${BASH_REMATCH[1]}
+            MINOR=${BASH_REMATCH[2]}
+            PATCH=${BASH_REMATCH[3]}
+            
+            # Increment patch version
+            NEXT_PATCH=$((PATCH + 1))
+            NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+            echo "Latest tag: $LATEST_TAG, Next version: $NEXT_VERSION"
+          else
+            echo "Warning: Latest tag '$LATEST_TAG' doesn't match vX.Y.Z format. Using base version: $BASE_VERSION"
+            # Fallback to base version if tag format is unexpected
+            NEXT_VERSION="$BASE_VERSION"
+          fi
+          
+          echo "new_version=${NEXT_VERSION}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List downloaded files (for debugging)
+        run: |
+          echo "Listing downloaded artifacts:"
+          ls -R artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.determine_version.outputs.new_version }}
+          name: Release v${{ steps.determine_version.outputs.new_version }}
+          files: artifacts/*/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
