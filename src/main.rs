@@ -13,7 +13,7 @@ use ratatui::Terminal;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use pulldown_cmark::{Parser, Options, html};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -165,7 +165,7 @@ impl App {
     fn set_filter(&mut self, path: Option<String>) {
         self.filter_path = path;
         if let Some(ref p) = self.filter_path {
-            self.rows = self.all_rows.iter().cloned().filter(|r| &r.path == p).collect();
+            self.rows = self.all_rows.iter().filter(|r| &r.path == p).cloned().collect();
         } else {
             self.rows = self.all_rows.clone();
         }
@@ -208,9 +208,10 @@ fn lines_for_message(msg: &Message) -> (Vec<Line<'static>>, Vec<String>) {
             // render plain text for search
             texts.push(format!("{}{}", indent, raw_line));
             // minimal styled rendering (reuse previous logic without accumulating plain again)
-            let mut line_spans: Vec<Span> = Vec::new();
-            line_spans.push(Span::raw(indent));
-            line_spans.push(Span::raw(raw_line.to_string()));
+            let line_spans: Vec<Span> = vec![
+                Span::raw(indent),
+                Span::raw(raw_line.to_string())
+            ];
             out.push(Line::from(line_spans));
         }
     }
@@ -264,7 +265,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     // widths computed above
 
-    let rows: Vec<Row> = app.rows.iter().enumerate().skip(app.top).take((chunks[2].height.max(1) - 0) as usize).map(|(i, r)| {
+    let rows: Vec<Row> = app.rows.iter().enumerate().skip(app.top).take(chunks[2].height.max(1) as usize).map(|(i, r)| {
         let date = format_time(r.date_ms);
         let cwd = chat_reader::short_path(&r.path);
         let msg = &r.first_msg;
@@ -518,7 +519,7 @@ fn main() -> Result<()> {
                     // Reapply search/filter/sort state
                     if app.list_search_query.is_empty() {
                         app.rows = app.all_rows.clone();
-                        if let Some(fp) = &app.filter_path { app.rows = app.rows.iter().cloned().filter(|r| &r.path == fp).collect(); }
+                        if let Some(fp) = &app.filter_path { app.rows = app.rows.iter().filter(|r| &r.path == fp).cloned().collect(); }
                         // resort current view
                         apply_sort(&mut app);
                     } else {
@@ -836,9 +837,9 @@ fn spawn_fs_watcher(app: &mut App) {
 }
 
 // Spawn watcher at startup and return its ping receiver
-fn spawn_initial_fs_watcher(projects: &PathBuf) -> Option<Receiver<()>> {
+fn spawn_initial_fs_watcher(projects: &Path) -> Option<Receiver<()>> {
     if projects.exists() {
-        let projects = projects.clone();
+        let projects = projects.to_path_buf();
         let (ping_tx, ping_rx) = mpsc::channel();
         thread::spawn(move || {
             let (txn, rxn) = mpsc::channel::<Result<notify::Event, notify::Error>>();

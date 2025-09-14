@@ -143,7 +143,7 @@ impl ChatReader {
                     let created = ["timestamp","createdAt","created_at","created"].iter().filter_map(|k| v.get(*k)).filter_map(parse_epoch).min();
                     (cwd, created)
                 } else { (None, None) };
-                list.push(ConversationMeta { id, path: cwd, created_at: created_at, file: path.to_path_buf() });
+                list.push(ConversationMeta { id, path: cwd, created_at, file: path.to_path_buf() });
             }
         }
         Ok(list)
@@ -155,9 +155,8 @@ impl ChatReader {
         let mut found: Option<PathBuf> = None;
         for entry in WalkDir::new(&projects).max_depth(2).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                if path.file_stem().and_then(|s| s.to_str()) == Some(id) { found = Some(path.to_path_buf()); break; }
-            }
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && path.file_stem().and_then(|s| s.to_str()) == Some(id) { found = Some(path.to_path_buf()); break; }
         }
         let file = found.ok_or_else(|| anyhow!("Conversation not found: {}", id))?;
         let f = File::open(&file).with_context(|| format!("open {}", file.display()))?;
@@ -288,7 +287,7 @@ impl ChatReader {
                         if let Some(out) = tr.get("stdout").and_then(|x| x.as_str()) {
                             if !out.trim().is_empty() {
                                 body.push_str("Stdout:\n\n```");
-                                body.push_str("\n");
+                                body.push('\n');
                                 body.push_str(out);
                                 body.push_str("\n```\n");
                             }
@@ -296,7 +295,7 @@ impl ChatReader {
                         if let Some(err) = tr.get("stderr").and_then(|x| x.as_str()) {
                             if !err.trim().is_empty() {
                                 body.push_str("Stderr:\n\n```");
-                                body.push_str("\n");
+                                body.push('\n');
                                 body.push_str(err);
                                 body.push_str("\n```\n");
                             }
@@ -324,7 +323,7 @@ impl ChatReader {
                     "message_start" => {
                         streaming = true;
                         stream_buf.clear();
-                        stream_role = v.get("message").and_then(|m| extract_role(m)).or(Some("assistant".into()));
+                        stream_role = v.get("message").and_then(extract_role).or(Some("assistant".into()));
                     }
                     // Text chunks
                     "content_block_delta" => {
@@ -366,7 +365,7 @@ impl ChatReader {
     pub fn earliest_message_time_ms<P: AsRef<Path>>(file: P) -> Option<i64> {
         let f = File::open(file).ok()?;
         let mut best: Option<i64> = None;
-        for line in BufReader::new(f).lines().flatten() {
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
             let v: Value = serde_json::from_str(&line).ok()?;
             let m = v.get("message").cloned().unwrap_or(v);
             // Try multiple timestamp fields
@@ -382,7 +381,7 @@ impl ChatReader {
     pub fn latest_message_time_ms<P: AsRef<Path>>(file: P) -> Option<i64> {
         let f = File::open(file).ok()?;
         let mut best: Option<i64> = None;
-        for line in BufReader::new(f).lines().flatten() {
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
             let v: Value = serde_json::from_str(&line).ok()?;
             let m = v.get("message").cloned().unwrap_or(v);
             let t = ["createdAt","created_at","created","timestamp","ts","time","date"]
