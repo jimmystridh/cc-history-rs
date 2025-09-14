@@ -188,8 +188,12 @@ impl ChatReader {
 
             // (helper declared above)
 
-            // 1) Direct message entries
-            if v.get("message").is_some() || v.get("role").is_some() || v.get("content").is_some() {
+            // 1) Direct message entries (skip streaming events)
+            let is_streaming_event = v.get("type").and_then(|t| t.as_str())
+                .map(|s| matches!(s, "message_start" | "content_block_start" | "content_block_delta" | "message_stop"))
+                .unwrap_or(false);
+            
+            if !is_streaming_event && (v.get("message").is_some() || v.get("role").is_some() || v.get("content").is_some()) {
                 // End any previous stream before pushing a discrete message
                 if streaming { streaming = false; }
                 flush_stream(&mut msgs, &mut stream_role, &mut stream_buf);
@@ -353,7 +357,7 @@ impl ChatReader {
         }
 
         // Flush any dangling stream buffer
-        if !streaming { flush_stream(&mut msgs, &mut stream_role, &mut stream_buf); }
+        if streaming { flush_stream(&mut msgs, &mut stream_role, &mut stream_buf); }
         let (cwd, created_at) = if let Some(v) = first_line_val {(
             v.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string()),
             ["timestamp","createdAt","created_at","created"].iter().filter_map(|k| v.get(*k)).filter_map(parse_epoch).min()
