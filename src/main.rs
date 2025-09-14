@@ -67,6 +67,12 @@ struct App {
     watcher_enabled: bool,
     // info modal
     show_info_modal: bool,
+    // settings modal
+    show_settings_modal: bool,
+    settings_claude_command: String,
+    settings_input_active: bool,
+    // resume session
+    resume_session_request: Option<(String, String)>, // (session_id, session_path)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +85,7 @@ impl App {
         let watch_pref = load_watcher_pref();
         let (sort_key_pref, sort_desc_pref) = load_sort_prefs();
         let filter_pref = load_filter_pref();
+        let claude_command_pref = load_claude_command_pref();
         if convos.is_empty() {
             let mut app = Self {
                 reader,
@@ -110,6 +117,10 @@ impl App {
                 fs_ping_rx: if watch_pref { spawn_initial_fs_watcher(&projects_dir) } else { None },
                 watcher_enabled: watch_pref,
                 show_info_modal: false,
+                show_settings_modal: false,
+                settings_claude_command: claude_command_pref.clone(),
+                settings_input_active: false,
+                resume_session_request: None,
             };
             if let Some(fp) = filter_pref { app.set_filter(Some(fp)); }
             return Ok(app);
@@ -160,6 +171,10 @@ impl App {
             fs_ping_rx: ping_rx,
             watcher_enabled: watch_pref,
             show_info_modal: false,
+            show_settings_modal: false,
+            settings_claude_command: claude_command_pref.clone(),
+            settings_input_active: false,
+            resume_session_request: None,
         };
         if let Some(fp) = filter_pref.clone() { app.set_filter(Some(fp)); } else { app.set_filter(None); }
         apply_sort(&mut app);
@@ -175,6 +190,10 @@ impl App {
         }
         self.selected = 0;
         self.top = 0;
+    }
+
+    fn is_input_active(&self) -> bool {
+        self.list_search_input || self.search_input || (self.show_settings_modal && self.settings_input_active)
     }
 }
 
@@ -293,7 +312,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let footer_text = if app.list_search_input {
         format!("/{}  — Enter run  Esc cancel", app.list_search_query)
     } else {
-        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   f filter cwd   / search   s sort key   o order   e export   i info   x clear   q quit ".to_string()
+        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   f filter cwd   / search   s sort key   o order   e export   i info   , settings   r resume   x clear   q quit ".to_string()
     };
     let footer = Paragraph::new(Line::from(Span::styled(footer_text, Style::default().fg(Color::White).bg(Color::Blue))));
     f.render_widget(footer, chunks[3]);
@@ -507,6 +526,99 @@ fn render_info_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(modal, popup_area);
 }
 
+fn render_settings_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    // Create modal popup area (centered, 50% width, 40% height)
+    let popup_area = Rect {
+        x: area.width / 4,
+        y: area.height / 3,
+        width: area.width / 2,
+        height: area.height / 3,
+    };
+
+    // Clear the area first
+    f.render_widget(Clear, popup_area);
+    
+    let settings_text = if app.settings_input_active {
+        format!(
+            "Settings\n\
+            \n\
+            Claude Command: {}_\n\
+            \n\
+            Enter to save, Esc to cancel",
+            app.settings_claude_command
+        )
+    } else {
+        format!(
+            "Settings\n\
+            \n\
+            Claude Command: {}\n\
+            \n\
+            Enter to edit, Esc to close",
+            app.settings_claude_command
+        )
+    };
+
+    let border_color = if app.settings_input_active { Color::Yellow } else { Color::Green };
+    
+    let modal = Paragraph::new(settings_text)
+        .block(
+            Block::default()
+                .title(" Settings ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+        )
+        .wrap(Wrap { trim: true })
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    f.render_widget(modal, popup_area);
+}
+
+fn resume_claude_session(claude_command: &str, session_id: &str, session_path: &str) -> Result<()> {
+    use std::process::Command;
+    
+    // Change to the session directory if it exists and is not empty
+    let working_dir = if !session_path.is_empty() && std::path::Path::new(session_path).exists() {
+        session_path
+    } else {
+        "." // fallback to current directory
+    };
+    
+    // Parse the command string to handle switches like "claude --my-switch"
+    let command_parts: Vec<&str> = claude_command.split_whitespace().collect();
+    if command_parts.is_empty() {
+        return Err(anyhow::anyhow!("Empty command string"));
+    }
+    
+    let program = command_parts[0];
+    let mut cmd = Command::new(program);
+    
+    // Add any existing arguments from the command string
+    if command_parts.len() > 1 {
+        cmd.args(&command_parts[1..]);
+    }
+    
+    // Add the --resume arguments
+    let status = cmd
+        .arg("--resume")
+        .arg(session_id)
+        .current_dir(working_dir)
+        .status();
+    
+    match status {
+        Ok(exit_status) => {
+            if exit_status.success() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "Claude command exited with status: {}",
+                    exit_status.code().unwrap_or(-1)
+                ))
+            }
+        }
+        Err(e) => Err(anyhow::anyhow!("Failed to execute claude command: {}", e))
+    }
+}
+
 fn main() -> Result<()> {
     // Optional override for projects directory
     let args: Vec<String> = std::env::args().collect();
@@ -612,6 +724,30 @@ fn main() -> Result<()> {
         }
         // React to FS ping
         if let Some(prx) = &app.fs_ping_rx { if prx.try_recv().is_ok() && !app.updating_in_progress { spawn_full_refresh(&mut app); } }
+        
+        // Handle resume session request
+        if let Some((session_id, session_path)) = app.resume_session_request.take() {
+            // Restore terminal state before launching external command
+            crossterm::terminal::disable_raw_mode()?;
+            crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
+            
+            // Execute claude command with proper terminal state
+            let result = resume_claude_session(&app.settings_claude_command, &session_id, &session_path);
+            
+            // Handle the result - if successful, exit; if error, show message and exit
+            match result {
+                Ok(_) => {
+                    // Command executed successfully, exit the app
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Show error message and exit
+                    eprintln!("Failed to resume session: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+        
         // Precompute size for lazy loading of first message previews
         if let Ok(sz) = terminal.size() { if let Mode::List = app.mode { ensure_first_msgs(&mut app, sz); } }
         terminal.draw(|f| {
@@ -619,6 +755,9 @@ fn main() -> Result<()> {
             match app.mode { Mode::List => render_list(f, size, &app), Mode::View => render_view(f, size, &app) }
             if app.show_info_modal {
                 render_info_modal(f, size, &app);
+            }
+            if app.show_settings_modal {
+                render_settings_modal(f, size, &app);
             }
         })?;
 
@@ -631,12 +770,13 @@ fn main() -> Result<()> {
                             // Quit
                             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => break,
                             KeyCode::Char('q') if !app.list_search_input => break,
-                            // Cancel search input or close info modal (do not quit)
+                            // Cancel search input or close modals (do not quit)
                             KeyCode::Esc if app.list_search_input => { app.list_search_input = false; },
                             KeyCode::Esc if app.show_info_modal => { app.show_info_modal = false; },
-                            KeyCode::Char('s') => { cycle_sort_key(&mut app); let _ = save_sort_prefs(app.sort_key, app.sort_desc); spawn_sort(&mut app); },
-                            KeyCode::Char('o') => { app.sort_desc = !app.sort_desc; let _ = save_sort_prefs(app.sort_key, app.sort_desc); spawn_sort(&mut app); },
-                            KeyCode::Char('w') => {
+                            KeyCode::Esc if app.show_settings_modal => { app.show_settings_modal = false; app.settings_input_active = false; },
+                            KeyCode::Char('s') if !app.is_input_active() => { cycle_sort_key(&mut app); let _ = save_sort_prefs(app.sort_key, app.sort_desc); spawn_sort(&mut app); },
+                            KeyCode::Char('o') if !app.is_input_active() => { app.sort_desc = !app.sort_desc; let _ = save_sort_prefs(app.sort_key, app.sort_desc); spawn_sort(&mut app); },
+                            KeyCode::Char('w') if !app.is_input_active() => {
                                 // toggle watcher
                                 if app.watcher_enabled {
                                     app.fs_ping_rx = None; app.watcher_enabled = false;
@@ -645,17 +785,40 @@ fn main() -> Result<()> {
                                 }
                                 let _ = save_watcher_pref(app.watcher_enabled);
                             },
-                            KeyCode::Char('i') if !app.list_search_input => { app.show_info_modal = true; },
+                            KeyCode::Char('i') if !app.is_input_active() => { app.show_info_modal = true; },
+                            KeyCode::Char(',') if !app.is_input_active() => { 
+                                app.show_settings_modal = true; 
+                                app.settings_claude_command = load_claude_command_pref();
+                            },
+                            KeyCode::Char('r') if !app.is_input_active() => {
+                                if let Some(row) = app.rows.get(app.selected) {
+                                    app.resume_session_request = Some((row.id.clone(), row.path.clone()));
+                                }
+                            },
                             KeyCode::Char('/') => { app.list_search_input = true; app.list_search_query.clear(); },
                             KeyCode::Enter if app.list_search_input => { spawn_list_search(&mut app); app.list_search_input = false; },
                             KeyCode::Backspace if app.list_search_input => { app.list_search_query.pop(); },
                             KeyCode::Char(c) if app.list_search_input => { app.list_search_query.push(c); },
+                            // Settings modal input handling
+                            KeyCode::Enter if app.show_settings_modal && app.settings_input_active => {
+                                app.settings_input_active = false;
+                                let _ = save_claude_command_pref(&app.settings_claude_command);
+                            },
+                            KeyCode::Enter if app.show_settings_modal && !app.settings_input_active => {
+                                app.settings_input_active = true;
+                            },
+                            KeyCode::Backspace if app.show_settings_modal && app.settings_input_active => { 
+                                app.settings_claude_command.pop(); 
+                            },
+                            KeyCode::Char(c) if app.show_settings_modal && app.settings_input_active => { 
+                                app.settings_claude_command.push(c); 
+                            },
                             KeyCode::Up => { if app.selected > 0 { app.selected -= 1; if app.selected < app.top { app.top = app.selected; } } },
                             KeyCode::Down => { if app.selected + 1 < app.rows.len() { app.selected += 1; let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize; if app.selected >= app.top + view_h { app.top = app.selected - view_h + 1; } } },
                             KeyCode::PageUp => { let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize; app.selected = app.selected.saturating_sub(view_h); app.top = app.top.saturating_sub(view_h); },
                             KeyCode::PageDown => { let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize; app.selected = (app.selected + view_h).min(app.rows.len().saturating_sub(1)); app.top = (app.top + view_h).min(app.rows.len().saturating_sub(1)); },
-                            KeyCode::Home | KeyCode::Char('g') => { app.selected = 0; app.top = 0; },
-                            KeyCode::End | KeyCode::Char('G') => {
+                            KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => { app.selected = 0; app.top = 0; },
+                            KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
                                 if !app.rows.is_empty() {
                                     app.selected = app.rows.len() - 1;
                                     let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize;
@@ -680,7 +843,7 @@ fn main() -> Result<()> {
                                     app.mode = Mode::View;
                                 }
                             },
-                            KeyCode::Char('f') => {
+                            KeyCode::Char('f') if !app.is_input_active() => {
                                 if let Some(row) = app.rows.get(app.selected) {
                                     if !row.path.is_empty() {
                                         let chosen = row.path.clone();
@@ -689,8 +852,8 @@ fn main() -> Result<()> {
                                     }
                                 }
                             },
-                            KeyCode::Char('x') => { app.set_filter(None); let _ = save_filter_pref(None); if !app.list_search_query.is_empty() { app.list_search_query.clear(); app.rows = app.all_rows.clone(); app.selected = 0; app.top = 0; } },
-                            KeyCode::Char('e') => { if let Some(row) = app.rows.get(app.selected) { if let Some(msgs) = app.messages_cache.get(&row.id) { let title = &row.id; if let Ok(path) = export_html(title, &row.path, msgs) { let _ = open::that(path); } } } },
+                            KeyCode::Char('x') if !app.is_input_active() => { app.set_filter(None); let _ = save_filter_pref(None); if !app.list_search_query.is_empty() { app.list_search_query.clear(); app.rows = app.all_rows.clone(); app.selected = 0; app.top = 0; } },
+                            KeyCode::Char('e') if !app.is_input_active() => { if let Some(row) = app.rows.get(app.selected) { if let Some(msgs) = app.messages_cache.get(&row.id) { let title = &row.id; if let Ok(path) = export_html(title, &row.path, msgs) { let _ = open::that(path); } } } },
                             _ => {}
                         }
                     }
@@ -702,8 +865,8 @@ fn main() -> Result<()> {
                             KeyCode::Down => { app.view_scroll = app.view_scroll.saturating_add(1); },
                             KeyCode::PageUp => { let h = terminal.size().unwrap().height.saturating_sub(4); app.view_scroll = app.view_scroll.saturating_sub(h); },
                             KeyCode::PageDown => { let h = terminal.size().unwrap().height.saturating_sub(4); app.view_scroll = app.view_scroll.saturating_add(h); },
-                            KeyCode::Home | KeyCode::Char('g') => { app.view_scroll = 0; },
-                            KeyCode::End | KeyCode::Char('G') => {
+                            KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => { app.view_scroll = 0; },
+                            KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
                                 let h = terminal.size().unwrap().height.saturating_sub(4);
                                 let max = app.view_lines.len().saturating_sub(h as usize);
                                 app.view_scroll = max as u16;
@@ -721,19 +884,19 @@ fn main() -> Result<()> {
                                 }
                                 app.search_input = false;
                             },
-                            KeyCode::Char('n') if !app.search_input && !app.search_matches.is_empty() => {
+                            KeyCode::Char('n') if !app.is_input_active() && !app.search_matches.is_empty() => {
                                 app.search_index = (app.search_index + 1) % app.search_matches.len();
                                 let line_idx = app.search_matches[app.search_index];
                                 app.view_scroll = line_idx as u16;
                             },
-                            KeyCode::Char('N') if !app.search_input && !app.search_matches.is_empty() => {
+                            KeyCode::Char('N') if !app.is_input_active() && !app.search_matches.is_empty() => {
                                 if app.search_index == 0 { app.search_index = app.search_matches.len() - 1; } else { app.search_index -= 1; }
                                 let line_idx = app.search_matches[app.search_index];
                                 app.view_scroll = line_idx as u16;
                             },
                             KeyCode::Char(c) if app.search_input => { app.search_query.push(c); },
                             KeyCode::Backspace if app.search_input => { app.search_query.pop(); },
-                            KeyCode::Char('e') => { if let Some(row) = app.rows.get(app.selected) { if let Some(msgs) = app.messages_cache.get(&row.id) { let title = &row.id; if let Ok(path) = export_html(title, &row.path, msgs) { let _ = open::that(path); } } } },
+                            KeyCode::Char('e') if !app.is_input_active() => { if let Some(row) = app.rows.get(app.selected) { if let Some(msgs) = app.messages_cache.get(&row.id) { let title = &row.id; if let Ok(path) = export_html(title, &row.path, msgs) { let _ = open::that(path); } } } },
                             _ => {}
                         }
                     }
@@ -989,6 +1152,18 @@ fn save_filter_pref(path: Option<&str>) -> Result<()> {
         Some(p) => v["filter_path"] = serde_json::json!(p),
         None => { let _ = v.as_object_mut().map(|m| m.remove("filter_path")); }
     }
+    write_config_json(&v)?;
+    Ok(())
+}
+
+fn load_claude_command_pref() -> String {
+    let v = read_config_json();
+    v.get("claude_command").and_then(|x| x.as_str()).unwrap_or("claude").to_string()
+}
+
+fn save_claude_command_pref(command: &str) -> Result<()> {
+    let mut v = read_config_json();
+    v["claude_command"] = serde_json::json!(command);
     write_config_json(&v)?;
     Ok(())
 }
