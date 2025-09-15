@@ -205,7 +205,8 @@ fn format_time(ms: i64) -> String {
     if ms <= 0 { return String::new(); }
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-    dt.format("%Y-%m-%d %H:%M").to_string()
+    let local_dt = dt.with_timezone(&chrono::Local);
+    local_dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
 fn lines_for_message(msg: &Message) -> (Vec<Line<'static>>, Vec<String>) {
@@ -484,7 +485,7 @@ fn render_info_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     // Create the modal content
     let created_date = if let Some(ts) = selected_row.date_ms.checked_div(1000) {
         chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| "Unknown".to_string())
     } else {
         "Unknown".to_string()
@@ -492,7 +493,7 @@ fn render_info_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     let last_msg_date = if let Some(ts) = selected_row.last_msg_ms.and_then(|ms| ms.checked_div(1000)) {
         chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| "Unknown".to_string())
     } else {
         "Unknown".to_string()

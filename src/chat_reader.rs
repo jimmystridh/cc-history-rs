@@ -133,15 +133,28 @@ impl ChatReader {
             if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                 let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
                 if id.is_empty() { continue; }
-                // read first line
-                let first_line = File::open(path).ok().and_then(|f| BufReader::new(f).lines().next().and_then(|l| l.ok()));
-                let (cwd, created_at) = if let Some(line) = first_line {
-                    let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-                    let cwd = v.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string())
-                        .or_else(|| v.get("workspace").and_then(|x| x.as_str()).map(|s| s.to_string()))
-                        .or_else(|| v.get("path").and_then(|x| x.as_str()).map(|s| s.to_string()));
-                    let created = ["timestamp","createdAt","created_at","created"].iter().filter_map(|k| v.get(*k)).filter_map(parse_epoch).min();
-                    (cwd, created)
+                // read lines until we find one with conversation metadata (skip summary lines)
+                let (cwd, created_at) = if let Ok(file) = File::open(path) {
+                    let reader = BufReader::new(file);
+                    let mut cwd = None;
+                    let mut created_at = None;
+                    
+                    for line_str in reader.lines().take(10).flatten() { // check first 10 lines max
+                        if let Ok(v) = serde_json::from_str::<Value>(&line_str) {
+                            // Look for lines that have conversation metadata (cwd or timestamp)
+                            if v.get("cwd").is_some() || v.get("timestamp").is_some() || v.get("sessionId").is_some() {
+                                cwd = v.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string())
+                                    .or_else(|| v.get("workspace").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                                    .or_else(|| v.get("path").and_then(|x| x.as_str()).map(|s| s.to_string()));
+                                created_at = ["timestamp","createdAt","created_at","created"].iter()
+                                    .filter_map(|k| v.get(*k))
+                                    .filter_map(parse_epoch)
+                                    .min();
+                                break;
+                            }
+                        }
+                    }
+                    (cwd, created_at)
                 } else { (None, None) };
                 list.push(ConversationMeta { id, path: cwd, created_at, file: path.to_path_buf() });
             }
