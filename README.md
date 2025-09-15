@@ -73,6 +73,14 @@ It reads session logs from `~/.claude/projects/**/<sessionId>.jsonl`, presents a
 
 ---
 
+## Download
+
+Pre-built binaries are available on the [Releases page](https://github.com/jimmystridh/cc-history-rs/releases).
+
+**Note for macOS users**: The macOS builds are currently not notarized. You may need to right-click the binary and select "Open" the first time, or run `xattr -d com.apple.quarantine cc-history` to remove the quarantine flag.
+
+---
+
 ## Quick start
 
 Requirements:
