@@ -198,12 +198,39 @@ jobs:
           echo "Listing downloaded artifacts:"
           ls -R artifacts
 
+      - name: Extract changelog for version
+        id: changelog
+        run: |
+          VERSION=${{ steps.determine_version.outputs.new_version }}
+          echo "Extracting changelog for version $VERSION"
+          
+          # Extract the section for this version from CHANGELOG.md
+          if [ -f "CHANGELOG.md" ]; then
+            # Find content between version headers, excluding the version line itself
+            CHANGELOG=$(sed -n "/## \[$VERSION\]/,/## \[/p" CHANGELOG.md | sed '1d;$d' | sed '/^[[:space:]]*$/d')
+            
+            # If no specific changelog found, provide a generic message
+            if [ -z "$CHANGELOG" ]; then
+              CHANGELOG="See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details."
+            fi
+          else
+            CHANGELOG="No changelog available for this version."
+          fi
+          
+          # Store the changelog content
+          {
+            echo "content<<EOF"
+            echo "$CHANGELOG"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+      
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.determine_version.outputs.new_version }}
           name: Release v${{ steps.determine_version.outputs.new_version }}
+          body: ${{ steps.changelog.outputs.content }}
           files: artifacts/*/*
-          generate_release_notes: true
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
