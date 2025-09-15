@@ -70,7 +70,8 @@ struct App {
     // settings modal
     show_settings_modal: bool,
     settings_claude_command: String,
-    settings_input_active: bool,
+    settings_quit_after_launch: bool,
+    settings_selected_field: usize, // 0 = claude_command, 1 = quit_after_launch
     // resume session
     resume_session_request: Option<(String, String)>, // (session_id, session_path)
 }
@@ -86,6 +87,7 @@ impl App {
         let (sort_key_pref, sort_desc_pref) = load_sort_prefs();
         let filter_pref = load_filter_pref();
         let claude_command_pref = load_claude_command_pref();
+        let quit_after_launch_pref = load_quit_after_launch_pref();
         if convos.is_empty() {
             let mut app = Self {
                 reader,
@@ -119,7 +121,8 @@ impl App {
                 show_info_modal: false,
                 show_settings_modal: false,
                 settings_claude_command: claude_command_pref.clone(),
-                settings_input_active: false,
+                settings_quit_after_launch: quit_after_launch_pref,
+                settings_selected_field: 0,
                 resume_session_request: None,
             };
             if let Some(fp) = filter_pref { app.set_filter(Some(fp)); }
@@ -173,7 +176,8 @@ impl App {
             show_info_modal: false,
             show_settings_modal: false,
             settings_claude_command: claude_command_pref.clone(),
-            settings_input_active: false,
+            settings_quit_after_launch: quit_after_launch_pref,
+            settings_selected_field: 0,
             resume_session_request: None,
         };
         if let Some(fp) = filter_pref.clone() { app.set_filter(Some(fp)); } else { app.set_filter(None); }
@@ -193,7 +197,7 @@ impl App {
     }
 
     fn is_input_active(&self) -> bool {
-        self.list_search_input || self.search_input || (self.show_settings_modal && self.settings_input_active)
+        self.list_search_input || self.search_input || self.show_settings_modal
     }
 }
 
@@ -527,45 +531,67 @@ fn render_info_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn render_settings_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    // Create modal popup area (centered, 50% width, 40% height)
+    // Create modal popup area (centered, 60% width, 50% height)
     let popup_area = Rect {
-        x: area.width / 4,
-        y: area.height / 3,
-        width: area.width / 2,
-        height: area.height / 3,
+        x: area.width / 5,
+        y: area.height / 4,
+        width: (area.width * 3) / 5,
+        height: area.height / 2,
     };
 
     // Clear the area first
     f.render_widget(Clear, popup_area);
     
-    let settings_text = if app.settings_input_active {
-        format!(
-            "Settings\n\
-            \n\
-            Claude Command: {}_\n\
-            \n\
-            Enter to save, Esc to cancel",
-            app.settings_claude_command
-        )
-    } else {
-        format!(
-            "Settings\n\
-            \n\
-            Claude Command: {}\n\
-            \n\
-            Enter to edit, Esc to close",
-            app.settings_claude_command
-        )
-    };
-
-    let border_color = if app.settings_input_active { Color::Yellow } else { Color::Green };
+    // Create lines for the settings
+    let mut lines = vec![
+        Line::from("Settings"),
+        Line::from(""),
+    ];
     
-    let modal = Paragraph::new(settings_text)
+    // Claude Command field
+    let claude_indicator = if app.settings_selected_field == 0 { " >" } else { "  " };
+    let claude_field = if app.settings_selected_field == 0 {
+        format!("{}Claude Command: [{}]", claude_indicator, app.settings_claude_command)
+    } else {
+        format!("{}Claude Command: {}", claude_indicator, app.settings_claude_command)
+    };
+    lines.push(Line::from(Span::styled(
+        claude_field,
+        if app.settings_selected_field == 0 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        }
+    )));
+    
+    lines.push(Line::from(""));
+    
+    // Quit after launch field
+    let quit_indicator = if app.settings_selected_field == 1 { " >" } else { "  " };
+    let quit_text = if app.settings_quit_after_launch { "Yes" } else { "No" };
+    let quit_field = if app.settings_selected_field == 1 {
+        format!("{}Quit after launch: [{}]", quit_indicator, quit_text)
+    } else {
+        format!("{}Quit after launch: {}", quit_indicator, quit_text)
+    };
+    lines.push(Line::from(Span::styled(
+        quit_field,
+        if app.settings_selected_field == 1 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        }
+    )));
+    
+    lines.push(Line::from(""));
+    lines.push(Line::from("↑/↓ navigate  Enter save  Esc cancel"));
+    
+    let modal = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(" Settings ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
+                .border_style(Style::default().fg(Color::Green))
         )
         .wrap(Wrap { trim: true })
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -603,11 +629,7 @@ fn resume_claude_session(claude_command: &str, session_id: &str, session_path: &
     match status {
         Ok(exit_status) => {
             // Print informational message regardless of exit status
-            let full_command = if command_parts.len() > 1 {
-                format!("{} --resume {}", claude_command, session_id)
-            } else {
-                format!("{} --resume {}", claude_command, session_id)
-            };
+            let full_command = format!("{} --resume {}", claude_command, session_id);
             
             let directory = if !session_path.is_empty() && std::path::Path::new(session_path).exists() {
                 session_path
@@ -745,14 +767,26 @@ fn main() -> Result<()> {
             // Execute claude command with proper terminal state
             let result = resume_claude_session(&app.settings_claude_command, &session_id, &session_path);
             
-            // Handle the result - if successful, exit; if error, show message and exit
+            // Handle the result based on quit_after_launch setting
             match result {
                 Ok(_) => {
-                    // Command executed successfully, exit the app
-                    return Ok(());
+                    if app.settings_quit_after_launch {
+                        // Command executed successfully, exit the app
+                        return Ok(());
+                    } else {
+                        // Restore terminal state and return to TUI
+                        crossterm::terminal::enable_raw_mode()?;
+                        crossterm::execute!(
+                            terminal.backend_mut(), 
+                            crossterm::terminal::EnterAlternateScreen,
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                        )?;
+                        terminal.clear()?;
+                        // Continue the main loop
+                    }
                 }
                 Err(e) => {
-                    // Show error message and exit
+                    // Show error message and exit regardless of setting
                     eprintln!("Failed to resume session: {}", e);
                     return Err(e);
                 }
@@ -784,7 +818,14 @@ fn main() -> Result<()> {
                             // Cancel search input or close modals (do not quit)
                             KeyCode::Esc if app.list_search_input => { app.list_search_input = false; },
                             KeyCode::Esc if app.show_info_modal => { app.show_info_modal = false; },
-                            KeyCode::Esc if app.show_settings_modal => { app.show_settings_modal = false; app.settings_input_active = false; },
+                            KeyCode::Esc if app.show_settings_modal => { 
+                                // Cancel all changes and close modal
+                                app.show_settings_modal = false; 
+                                app.settings_selected_field = 0;
+                                // Reload original values
+                                app.settings_claude_command = load_claude_command_pref();
+                                app.settings_quit_after_launch = load_quit_after_launch_pref();
+                            },
                             KeyCode::Char('s') if !app.is_input_active() => { cycle_sort_key(&mut app); let _ = save_sort_prefs(app.sort_key, app.sort_desc); spawn_sort(&mut app); },
                             KeyCode::Char('o') if !app.is_input_active() => { app.sort_desc = !app.sort_desc; let _ = save_sort_prefs(app.sort_key, app.sort_desc); spawn_sort(&mut app); },
                             KeyCode::Char('w') if !app.is_input_active() => {
@@ -799,7 +840,9 @@ fn main() -> Result<()> {
                             KeyCode::Char('i') if !app.is_input_active() => { app.show_info_modal = true; },
                             KeyCode::Char(',') if !app.is_input_active() => { 
                                 app.show_settings_modal = true; 
+                                app.settings_selected_field = 0;
                                 app.settings_claude_command = load_claude_command_pref();
+                                app.settings_quit_after_launch = load_quit_after_launch_pref();
                             },
                             KeyCode::Char('r') if !app.is_input_active() => {
                                 if let Some(row) = app.rows.get(app.selected) {
@@ -811,21 +854,34 @@ fn main() -> Result<()> {
                             KeyCode::Backspace if app.list_search_input => { app.list_search_query.pop(); },
                             KeyCode::Char(c) if app.list_search_input => { app.list_search_query.push(c); },
                             // Settings modal input handling
-                            KeyCode::Enter if app.show_settings_modal && app.settings_input_active => {
-                                app.settings_input_active = false;
+                            KeyCode::Enter if app.show_settings_modal => {
+                                // Save all settings and close modal
                                 let _ = save_claude_command_pref(&app.settings_claude_command);
+                                let _ = save_quit_after_launch_pref(app.settings_quit_after_launch);
+                                app.show_settings_modal = false;
+                                app.settings_selected_field = 0;
                             },
-                            KeyCode::Enter if app.show_settings_modal && !app.settings_input_active => {
-                                app.settings_input_active = true;
+                            KeyCode::Up if app.show_settings_modal => {
+                                if app.settings_selected_field > 0 {
+                                    app.settings_selected_field -= 1;
+                                }
                             },
-                            KeyCode::Backspace if app.show_settings_modal && app.settings_input_active => { 
+                            KeyCode::Down if app.show_settings_modal => {
+                                if app.settings_selected_field < 1 {
+                                    app.settings_selected_field += 1;
+                                }
+                            },
+                            KeyCode::Backspace if app.show_settings_modal && app.settings_selected_field == 0 => { 
                                 app.settings_claude_command.pop(); 
                             },
-                            KeyCode::Char(c) if app.show_settings_modal && app.settings_input_active => { 
+                            KeyCode::Char(c) if app.show_settings_modal && app.settings_selected_field == 0 => { 
                                 app.settings_claude_command.push(c); 
                             },
-                            KeyCode::Up => { if app.selected > 0 { app.selected -= 1; if app.selected < app.top { app.top = app.selected; } } },
-                            KeyCode::Down => { if app.selected + 1 < app.rows.len() { app.selected += 1; let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize; if app.selected >= app.top + view_h { app.top = app.selected - view_h + 1; } } },
+                            KeyCode::Char(' ') | KeyCode::Char('y') | KeyCode::Char('n') if app.show_settings_modal && app.settings_selected_field == 1 => {
+                                app.settings_quit_after_launch = !app.settings_quit_after_launch;
+                            },
+                            KeyCode::Up if !app.show_settings_modal => { if app.selected > 0 { app.selected -= 1; if app.selected < app.top { app.top = app.selected; } } },
+                            KeyCode::Down if !app.show_settings_modal => { if app.selected + 1 < app.rows.len() { app.selected += 1; let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize; if app.selected >= app.top + view_h { app.top = app.selected - view_h + 1; } } },
                             KeyCode::PageUp => { let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize; app.selected = app.selected.saturating_sub(view_h); app.top = app.top.saturating_sub(view_h); },
                             KeyCode::PageDown => { let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize; app.selected = (app.selected + view_h).min(app.rows.len().saturating_sub(1)); app.top = (app.top + view_h).min(app.rows.len().saturating_sub(1)); },
                             KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => { app.selected = 0; app.top = 0; },
@@ -1175,6 +1231,18 @@ fn load_claude_command_pref() -> String {
 fn save_claude_command_pref(command: &str) -> Result<()> {
     let mut v = read_config_json();
     v["claude_command"] = serde_json::json!(command);
+    write_config_json(&v)?;
+    Ok(())
+}
+
+fn load_quit_after_launch_pref() -> bool {
+    let v = read_config_json();
+    v.get("quit_after_launch").and_then(|x| x.as_bool()).unwrap_or(true)
+}
+
+fn save_quit_after_launch_pref(quit_after_launch: bool) -> Result<()> {
+    let mut v = read_config_json();
+    v["quit_after_launch"] = serde_json::json!(quit_after_launch);
     write_config_json(&v)?;
     Ok(())
 }

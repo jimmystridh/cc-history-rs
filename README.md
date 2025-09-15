@@ -52,14 +52,18 @@ It reads session logs from `~/.claude/projects/**/<sessionId>.jsonl`, presents a
 - Settings modal
   - Press `,` (comma) to open settings configuration
   - Configure Claude command (defaults to "claude")
-  - Press `Enter` to edit the command, `Enter` again to save, `Esc` to cancel/close
+  - Configure quit-after-launch behavior (defaults to "Yes")
+  - Use ↑/↓ to navigate between fields, type directly to edit
+  - Press `Enter` to save all changes, `Esc` to cancel and restore original values
   - Settings persist to `~/.config/cc-history/config.json`
 
 - Session resumption
   - Press `r` to resume the selected session in Claude Code
   - Executes the configured Claude command with `--resume <session_id>` in the session's project directory
   - Supports command switches (e.g., `claude --verbose` becomes `claude --verbose --resume <session_id>`)
-  - Application exits after launching Claude (does not return to browser)
+  - Behavior after Claude exits depends on "Quit after launch" setting:
+    - "Yes": Application exits (does not return to browser)
+    - "No": Returns to cc-history TUI for continued browsing (terminal state fully restored)
   - Terminal state is properly restored for the launched session
   - Displays informational message showing the command executed and directory used
 
