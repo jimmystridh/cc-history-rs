@@ -576,13 +576,6 @@ fn render_settings_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
 fn resume_claude_session(claude_command: &str, session_id: &str, session_path: &str) -> Result<()> {
     use std::process::Command;
     
-    // Change to the session directory if it exists and is not empty
-    let working_dir = if !session_path.is_empty() && std::path::Path::new(session_path).exists() {
-        session_path
-    } else {
-        "." // fallback to current directory
-    };
-    
     // Parse the command string to handle switches like "claude --my-switch"
     let command_parts: Vec<&str> = claude_command.split_whitespace().collect();
     if command_parts.is_empty() {
@@ -597,15 +590,33 @@ fn resume_claude_session(claude_command: &str, session_id: &str, session_path: &
         cmd.args(&command_parts[1..]);
     }
     
+    // Set working directory for the command if session path exists
+    if !session_path.is_empty() && std::path::Path::new(session_path).exists() {
+        cmd.current_dir(session_path);
+    }
+    
     // Add the --resume arguments
-    let status = cmd
-        .arg("--resume")
-        .arg(session_id)
-        .current_dir(working_dir)
-        .status();
+    cmd.arg("--resume").arg(session_id);
+    
+    let status = cmd.status();
     
     match status {
         Ok(exit_status) => {
+            // Print informational message regardless of exit status
+            let full_command = if command_parts.len() > 1 {
+                format!("{} --resume {}", claude_command, session_id)
+            } else {
+                format!("{} --resume {}", claude_command, session_id)
+            };
+            
+            let directory = if !session_path.is_empty() && std::path::Path::new(session_path).exists() {
+                session_path
+            } else {
+                "current directory"
+            };
+            
+            println!("Ran `{}` for session {} in directory {}", full_command, session_id, directory);
+            
             if exit_status.success() {
                 Ok(())
             } else {

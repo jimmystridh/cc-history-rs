@@ -57,11 +57,11 @@ It reads session logs from `~/.claude/projects/**/<sessionId>.jsonl`, presents a
 
 - Session resumption
   - Press `r` to resume the selected session in Claude Code
-  - Changes working directory to the session's project path
-  - Executes the configured Claude command with `--resume <session_id>`
+  - Executes the configured Claude command with `--resume <session_id>` in the session's project directory
   - Supports command switches (e.g., `claude --verbose` becomes `claude --verbose --resume <session_id>`)
   - Application exits after launching Claude (does not return to browser)
   - Terminal state is properly restored for the launched session
+  - Displays informational message showing the command executed and directory used
 
 - Export
   - Export current conversation to `exports/conversation-<id>.html` (`e`) and open in default browser
