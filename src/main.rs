@@ -350,7 +350,13 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
         if let Some((marker, fence_len)) = detect_code_fence(trimmed_line) {
             if in_code {
                 if fence_char == Some(marker) {
-                    push_code_block(&mut out, &mut texts, &code_buffer, code_lang.as_deref());
+                    push_code_block(
+                        &mut out,
+                        &mut texts,
+                        &code_buffer,
+                        code_lang.as_deref(),
+                        msg.role.contains("tool"),
+                    );
                     code_buffer.clear();
                     code_lang = None;
                     fence_char = None;
@@ -384,7 +390,13 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
     }
 
     if in_code {
-        push_code_block(&mut out, &mut texts, &code_buffer, code_lang.as_deref());
+        push_code_block(
+            &mut out,
+            &mut texts,
+            &code_buffer,
+            code_lang.as_deref(),
+            msg.role.contains("tool"),
+        );
     }
 
     (out, texts)
@@ -409,6 +421,7 @@ fn push_code_block(
     texts: &mut Vec<String>,
     code_buffer: &[String],
     lang_hint: Option<&str>,
+    monochrome: bool,
 ) {
     if code_buffer.is_empty() {
         texts.push(CODE_INDENT.to_string());
@@ -422,7 +435,7 @@ fn push_code_block(
         return;
     }
 
-    let highlighted = highlight_code_block(code_buffer, lang_hint);
+    let highlighted = highlight_code_block(code_buffer, lang_hint, monochrome);
     for line in highlighted {
         out.push(line);
     }
@@ -431,7 +444,11 @@ fn push_code_block(
     }
 }
 
-fn highlight_code_block(code_lines: &[String], lang_hint: Option<&str>) -> Vec<Line<'static>> {
+fn highlight_code_block(
+    code_lines: &[String],
+    lang_hint: Option<&str>,
+    monochrome: bool,
+) -> Vec<Line<'static>> {
     let syntax_set = &*SYNTAX_SET;
     let syntax = select_syntax(lang_hint, code_lines, syntax_set);
     let mut highlighter = HighlightLines::new(syntax, &SYNTAX_THEME);
@@ -443,6 +460,19 @@ fn highlight_code_block(code_lines: &[String], lang_hint: Option<&str>) -> Vec<L
             CODE_INDENT.to_string(),
             Style::default().fg(Color::DarkGray),
         ));
+
+        if monochrome {
+            if line.is_empty() {
+                spans.push(Span::raw(String::new()));
+            } else {
+                spans.push(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Rgb(200, 200, 200)),
+                ));
+            }
+            result.push(Line::from(spans));
+            continue;
+        }
 
         match highlighter.highlight_line(line, syntax_set) {
             Ok(ranges) => {
