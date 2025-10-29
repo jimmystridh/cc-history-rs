@@ -23,6 +23,7 @@ thiserror = "1.0"
 pulldown-cmark = "0.10"
 notify = "6"
 similar = "2.4"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
 
 [dev-dependencies]
 tempfile = "3.12"

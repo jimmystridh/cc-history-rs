@@ -5,10 +5,11 @@ use chat_reader::{sort_conversations_by_earliest, ChatReader, Message};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use notify::{RecursiveMode, Watcher};
+use once_cell::sync::Lazy;
 use pulldown_cmark::{html, Options, Parser};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Terminal;
@@ -19,12 +20,28 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     List,
     View,
 }
+
+static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
+static SYNTAX_THEME: Lazy<Theme> = Lazy::new(|| {
+    let mut themes = ThemeSet::load_defaults();
+    themes
+        .themes
+        .remove("base16-ocean.dark")
+        .or_else(|| themes.themes.remove("Solarized (dark)"))
+        .or_else(|| themes.themes.into_values().next())
+        .expect("syntect default themes available")
+});
+
+const CODE_INDENT: &str = "     ";
 
 #[derive(Clone)]
 struct RowItem {
@@ -282,6 +299,7 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
     if trimmed.is_empty() {
         return (out, texts);
     }
+
     let (prefix, title, header_text) = if msg.role == "user" {
         (
             Span::styled("You  » ", Style::default().fg(Color::Green)),
@@ -309,37 +327,301 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
     texts.push(header_text.to_string());
 
     if msg.role.contains("tool") && !show_tools {
-        let indent = "     ";
         let preview = tool_preview_summary(trimmed);
         let summary = format!("[tool result] {}  (t to expand)", preview);
         out.push(Line::from(vec![
-            Span::raw(indent),
+            Span::styled(
+                CODE_INDENT.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(summary.clone(), Style::default().fg(Color::Yellow)),
         ]));
-        texts.push(format!("{}{}", indent, summary));
+        texts.push(format!("{}{}", CODE_INDENT, summary));
         return (out, texts);
     }
 
     let mut in_code = false;
+    let mut code_buffer: Vec<String> = Vec::new();
+    let mut code_lang: Option<String> = None;
+    let mut fence_char: Option<char> = None;
+
     for raw_line in trimmed.lines() {
-        if raw_line.trim_start().starts_with("```") {
-            in_code = !in_code;
-            continue;
+        let trimmed_line = raw_line.trim_start();
+        if let Some((marker, fence_len)) = detect_code_fence(trimmed_line) {
+            if in_code {
+                if fence_char == Some(marker) {
+                    push_code_block(&mut out, &mut texts, &code_buffer, code_lang.as_deref());
+                    code_buffer.clear();
+                    code_lang = None;
+                    fence_char = None;
+                    in_code = false;
+                    continue;
+                }
+            } else {
+                in_code = true;
+                fence_char = Some(marker);
+                let info = trimmed_line[fence_len..].trim();
+                if !info.is_empty() {
+                    let lang = info.split_whitespace().next().unwrap_or(info);
+                    code_lang = Some(lang.to_string());
+                }
+                continue;
+            }
         }
-        let indent = "     ";
+
         if in_code {
-            let s = Span::styled(raw_line.to_string(), Style::default().fg(Color::Gray));
-            out.push(Line::from(vec![Span::raw(indent), s]));
-            texts.push(format!("{}{}", indent, raw_line));
+            code_buffer.push(raw_line.to_string());
         } else {
-            // render plain text for search
-            texts.push(format!("{}{}", indent, raw_line));
-            // minimal styled rendering (reuse previous logic without accumulating plain again)
-            let line_spans: Vec<Span> = vec![Span::raw(indent), Span::raw(raw_line.to_string())];
-            out.push(Line::from(line_spans));
+            texts.push(format!("{}{}", CODE_INDENT, raw_line));
+            let mut spans = Vec::with_capacity(2);
+            spans.push(Span::styled(
+                CODE_INDENT.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::raw(raw_line.to_string()));
+            out.push(Line::from(spans));
         }
     }
+
+    if in_code {
+        push_code_block(&mut out, &mut texts, &code_buffer, code_lang.as_deref());
+    }
+
     (out, texts)
+}
+
+fn detect_code_fence(line: &str) -> Option<(char, usize)> {
+    let mut chars = line.chars();
+    let first = chars.next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = line.chars().take_while(|c| *c == first).count();
+    if count >= 3 {
+        Some((first, count))
+    } else {
+        None
+    }
+}
+
+fn push_code_block(
+    out: &mut Vec<Line<'static>>,
+    texts: &mut Vec<String>,
+    code_buffer: &[String],
+    lang_hint: Option<&str>,
+) {
+    if code_buffer.is_empty() {
+        texts.push(CODE_INDENT.to_string());
+        out.push(Line::from(vec![
+            Span::styled(
+                CODE_INDENT.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(String::new()),
+        ]));
+        return;
+    }
+
+    let highlighted = highlight_code_block(code_buffer, lang_hint);
+    for line in highlighted {
+        out.push(line);
+    }
+    for raw in code_buffer {
+        texts.push(format!("{}{}", CODE_INDENT, raw));
+    }
+}
+
+fn highlight_code_block(code_lines: &[String], lang_hint: Option<&str>) -> Vec<Line<'static>> {
+    let syntax_set = &*SYNTAX_SET;
+    let syntax = select_syntax(lang_hint, code_lines, syntax_set);
+    let mut highlighter = HighlightLines::new(syntax, &SYNTAX_THEME);
+    let mut result = Vec::with_capacity(code_lines.len());
+
+    for line in code_lines {
+        let mut spans = Vec::new();
+        spans.push(Span::styled(
+            CODE_INDENT.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+
+        match highlighter.highlight_line(line, syntax_set) {
+            Ok(ranges) => {
+                if ranges.is_empty() {
+                    spans.push(Span::raw(String::new()));
+                } else {
+                    for (style, piece) in ranges {
+                        if piece.is_empty() {
+                            continue;
+                        }
+                        spans.push(Span::styled(piece.to_string(), style_to_tui(style)));
+                    }
+                }
+            }
+            Err(_) => {
+                spans.push(Span::raw(line.to_string()));
+            }
+        }
+
+        result.push(Line::from(spans));
+    }
+
+    result
+}
+
+fn select_syntax<'a>(
+    lang_hint: Option<&str>,
+    code_lines: &[String],
+    syntax_set: &'a SyntaxSet,
+) -> &'a SyntaxReference {
+    if let Some(token) = lang_hint {
+        if let Some(syn) = find_syntax_for_token(token, syntax_set) {
+            return syn;
+        }
+    }
+
+    if let Some(line) = code_lines.iter().find(|l| !l.trim().is_empty()) {
+        if let Some(syn) = syntax_set.find_syntax_by_first_line(line) {
+            return syn;
+        }
+    }
+
+    syntax_set.find_syntax_plain_text()
+}
+
+fn find_syntax_for_token<'a>(
+    token: &str,
+    syntax_set: &'a SyntaxSet,
+) -> Option<&'a SyntaxReference> {
+    let trimmed = token.trim_matches(|c: char| c == '{' || c == '}' || c == '`');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut seen = HashSet::new();
+    for candidate in language_candidates(trimmed) {
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        if let Some(syn) = syntax_set.find_syntax_by_token(&candidate) {
+            return Some(syn);
+        }
+        if let Some(syn) = syntax_set.find_syntax_by_extension(&candidate) {
+            return Some(syn);
+        }
+    }
+
+    None
+}
+
+fn language_candidates(token: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return candidates;
+    }
+
+    candidates.push(trimmed.to_string());
+    candidates.push(trimmed.to_lowercase());
+
+    let sanitized = trimmed.trim_matches(|c: char| {
+        !c.is_alphanumeric() && c != '+' && c != '#' && c != '.' && c != '_'
+    });
+    if !sanitized.is_empty() && sanitized != trimmed {
+        candidates.push(sanitized.to_string());
+        candidates.push(sanitized.to_lowercase());
+    }
+
+    if let Some(alias) = map_language_alias(trimmed) {
+        candidates.push(alias.to_string());
+    }
+    if sanitized != trimmed {
+        if let Some(alias) = map_language_alias(sanitized) {
+            candidates.push(alias.to_string());
+        }
+    }
+
+    if trimmed.contains('+') {
+        candidates.push(trimmed.replace('+', "p"));
+    }
+    if trimmed.contains('#') {
+        candidates.push(trimmed.replace('#', "sharp"));
+    }
+    if trimmed.contains('.') {
+        candidates.push(trimmed.split('.').last().unwrap_or(trimmed).to_string());
+    }
+
+    candidates
+}
+
+fn map_language_alias(token: &str) -> Option<&'static str> {
+    let lower = token.to_lowercase();
+    match lower.as_str() {
+        "c++" | "cpp" => Some("cpp"),
+        "c#" | "cs" | "csharp" => Some("csharp"),
+        "shell" | "bash" | "sh" | "zsh" | "shell-session" => Some("bash"),
+        "console" | "terminal" => Some("bash"),
+        "powershell" | "ps" | "ps1" => Some("powershell"),
+        "py" | "python" => Some("python"),
+        "rb" | "ruby" => Some("ruby"),
+        "js" | "javascript" | "mjs" | "cjs" => Some("javascript"),
+        "ts" | "typescript" => Some("typescript"),
+        "tsx" | "typescriptreact" => Some("tsx"),
+        "jsx" => Some("jsx"),
+        "rs" | "rust" => Some("rust"),
+        "go" | "golang" => Some("go"),
+        "kt" | "kotlin" => Some("kotlin"),
+        "java" => Some("java"),
+        "swift" => Some("swift"),
+        "scala" => Some("scala"),
+        "php" => Some("php"),
+        "hs" | "haskell" => Some("haskell"),
+        "erl" | "erlang" => Some("erlang"),
+        "ex" | "elixir" => Some("elixir"),
+        "html" | "htm" => Some("html"),
+        "xml" => Some("xml"),
+        "jsonl" | "json" => Some("json"),
+        "yaml" | "yml" => Some("yaml"),
+        "toml" => Some("toml"),
+        "ini" | "cfg" => Some("ini"),
+        "properties" | "props" => Some("properties"),
+        "docker" | "dockerfile" => Some("dockerfile"),
+        "make" | "makefile" => Some("makefile"),
+        "cmake" => Some("cmake"),
+        "gradle" => Some("groovy"),
+        "sql" => Some("sql"),
+        "diff" | "patch" => Some("diff"),
+        "terraform" | "tf" => Some("terraform"),
+        "proto" | "protobuf" => Some("proto"),
+        "markdown" | "md" => Some("markdown"),
+        "latex" | "tex" => Some("latex"),
+        _ => None,
+    }
+}
+
+fn style_to_tui(style: SyntectStyle) -> Style {
+    let fg = style.foreground;
+    let fg_color = if fg.a == 0 {
+        Color::Rgb(220, 220, 220)
+    } else {
+        Color::Rgb(fg.r, fg.g, fg.b)
+    };
+
+    let mut render_style = Style::default().fg(fg_color);
+    let mut modifiers = Modifier::empty();
+    if style.font_style.contains(FontStyle::BOLD) {
+        modifiers |= Modifier::BOLD;
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        modifiers |= Modifier::ITALIC;
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    if !modifiers.is_empty() {
+        render_style = render_style.add_modifier(modifiers);
+    }
+
+    render_style
 }
 
 fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
