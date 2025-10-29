@@ -12,11 +12,11 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Terminal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,17 @@ struct RowItem {
     last_msg_ms: Option<i64>,
 }
 
+struct FirstMsgRequest {
+    id: String,
+    file_path: String,
+}
+
+struct FirstMsgResult {
+    id: String,
+    first_msg: Option<String>,
+    messages: Vec<Message>,
+}
+
 struct App {
     reader: ChatReader,
     projects_dir: PathBuf,
@@ -49,6 +60,7 @@ struct App {
     view_lines: Vec<Line<'static>>,
     view_scroll: u16,
     view_text: Vec<String>,
+    view_show_tools: bool,
     search_input: bool,
     search_query: String,
     search_matches: Vec<usize>,
@@ -77,6 +89,10 @@ struct App {
     settings_selected_field: usize, // 0 = claude_command, 1 = quit_after_launch
     // resume session
     resume_session_request: Option<(String, String)>, // (session_id, session_path)
+    // async first message loading
+    first_msg_tx: Option<Sender<FirstMsgRequest>>,
+    first_msg_rx: Option<Receiver<FirstMsgResult>>,
+    first_msg_pending: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +106,8 @@ impl App {
     fn new_with_projects(projects_dir: PathBuf) -> Result<Self> {
         let reader = ChatReader::with_projects_dir(projects_dir.clone());
         let mut convos = reader.list_conversations()?;
+        let (first_msg_tx, first_msg_rx) = spawn_first_msg_loader(projects_dir.clone());
+        let mut first_msg_rx_opt = Some(first_msg_rx);
         let watch_pref = load_watcher_pref();
         let (sort_key_pref, sort_desc_pref) = load_sort_prefs();
         let filter_pref = load_filter_pref();
@@ -109,6 +127,7 @@ impl App {
                 view_lines: vec![],
                 view_scroll: 0,
                 view_text: vec![],
+                view_show_tools: false,
                 search_input: false,
                 search_query: String::new(),
                 search_matches: vec![],
@@ -135,6 +154,9 @@ impl App {
                 settings_quit_after_launch: quit_after_launch_pref,
                 settings_selected_field: 0,
                 resume_session_request: None,
+                first_msg_tx: Some(first_msg_tx.clone()),
+                first_msg_rx: first_msg_rx_opt.take(),
+                first_msg_pending: HashSet::new(),
             };
             if let Some(fp) = filter_pref {
                 app.set_filter(Some(fp));
@@ -186,6 +208,7 @@ impl App {
             view_lines: vec![],
             view_scroll: 0,
             view_text: vec![],
+            view_show_tools: false,
             search_input: false,
             search_query: String::new(),
             search_matches: vec![],
@@ -208,6 +231,9 @@ impl App {
             settings_quit_after_launch: quit_after_launch_pref,
             settings_selected_field: 0,
             resume_session_request: None,
+            first_msg_tx: Some(first_msg_tx.clone()),
+            first_msg_rx: first_msg_rx_opt.take(),
+            first_msg_pending: HashSet::new(),
         };
         if let Some(fp) = filter_pref.clone() {
             app.set_filter(Some(fp));
@@ -249,7 +275,7 @@ fn format_time(ms: i64) -> String {
     local_dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
-fn lines_for_message(msg: &Message) -> (Vec<Line<'static>>, Vec<String>) {
+fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Vec<String>) {
     let mut out: Vec<Line> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
     let trimmed = msg.content.trim();
@@ -281,6 +307,18 @@ fn lines_for_message(msg: &Message) -> (Vec<Line<'static>>, Vec<String>) {
         Span::raw(":"),
     ]));
     texts.push(header_text.to_string());
+
+    if msg.role.contains("tool") && !show_tools {
+        let indent = "     ";
+        let preview = tool_preview_summary(trimmed);
+        let summary = format!("[tool result] {}  (t to expand)", preview);
+        out.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled(summary.clone(), Style::default().fg(Color::Yellow)),
+        ]));
+        texts.push(format!("{}{}", indent, summary));
+        return (out, texts);
+    }
 
     let mut in_code = false;
     for raw_line in trimmed.lines() {
@@ -490,17 +528,17 @@ fn render_view(f: &mut ratatui::Frame, area: Rect, app: &App) {
         format!("/{}", app.search_query)
     } else if !app.search_query.is_empty() {
         if app.search_matches.is_empty() {
-            String::from(" 0/0 — / to search ")
+            String::from(" 0/0 — / to search — t toggle tools ")
         } else {
             format!(
-                " {}/{} — n/N next/prev — / new search ",
+                " {}/{} — n/N next/prev — / new search — t toggle tools ",
                 app.search_index + 1,
                 app.search_matches.len()
             )
         }
     } else {
         String::from(
-            " ↑/↓ scroll   PgUp/PgDn page   Home/g top   End/G bottom   / search   Esc/q back   i info   r resume   e export ",
+            " ↑/↓ scroll   PgUp/PgDn page   Home/g top   End/G bottom   / search   t toggle tools   Esc/q back   i info   r resume   e export ",
         )
     };
     let footer = Paragraph::new(Line::from(Span::styled(
@@ -532,6 +570,39 @@ fn highlight_current_line(lines: &Vec<Line<'static>>, idx: usize) -> Vec<Line<'s
         }
     }
     out
+}
+
+fn tool_preview_summary(content: &str) -> String {
+    let filtered: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let is_noise = |line: &str| {
+        line == "```"
+            || line == "````"
+            || line.starts_with("◀ Tool Result")
+            || line.starts_with("<system-reminder>")
+            || line.starts_with("</system-reminder>")
+    };
+
+    for (idx, line) in filtered.iter().enumerate() {
+        if is_noise(line) {
+            continue;
+        }
+        if line.starts_with("Stdout:") || line.starts_with("Stderr:") {
+            let detail = filtered.iter().skip(idx + 1).find(|next| !is_noise(next));
+            if let Some(next) = detail {
+                let combined = format!("{} {}", line, next);
+                return single_line_preview(&combined, 120);
+            }
+            return single_line_preview(line, 120);
+        }
+        return single_line_preview(line, 120);
+    }
+
+    String::from("tool output available")
 }
 
 fn pad(s: &str, width: usize) -> String {
@@ -826,9 +897,41 @@ fn combine_segments(segments: &[PathSegment], last: &str) -> String {
     out
 }
 
+fn list_visible_height(total_height: u16) -> usize {
+    usize::from(total_height.saturating_sub(4).max(1))
+}
+
+fn view_visible_height(total_height: u16) -> usize {
+    usize::from(total_height.saturating_sub(4).max(1))
+}
+
+fn adjust_list_window(app: &mut App, view_height: usize) {
+    if app.rows.is_empty() {
+        app.selected = 0;
+        app.top = 0;
+        return;
+    }
+    if app.selected >= app.rows.len() {
+        app.selected = app.rows.len() - 1;
+    }
+    let max_top = app.rows.len().saturating_sub(view_height);
+    let desired_top = app.selected.saturating_sub(view_height.saturating_sub(1));
+    app.top = desired_top.min(max_top);
+}
+
+fn set_view_scroll(app: &mut App, value: usize, view_height: usize) {
+    let max_scroll = app
+        .view_lines
+        .len()
+        .saturating_sub(view_height)
+        .min(u16::MAX as usize);
+    let capped = value.min(max_scroll);
+    app.view_scroll = capped as u16;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_path_cell;
+    use super::{first_nonempty_text, format_path_cell, tool_preview_summary, Message};
 
     #[test]
     fn keeps_home_prefix_for_short_paths() {
@@ -862,13 +965,44 @@ mod tests {
             "C:/…/project"
         );
     }
+
+    #[test]
+    fn preview_prefers_last_assistant_when_available() {
+        let msgs = vec![
+            Message {
+                role: "user".into(),
+                content: "Warmup".into(),
+            },
+            Message {
+                role: "assistant".into(),
+                content: "Final assistant summary".into(),
+            },
+        ];
+        let preview = first_nonempty_text(&msgs).expect("preview");
+        assert_eq!(preview, "Final assistant summary");
+    }
+
+    #[test]
+    fn tool_preview_skips_header_and_uses_stdout_line() {
+        let content = "◀ Tool Result\n\nStdout:\n\n```\nfirst line\nsecond line\n```\n";
+        assert_eq!(tool_preview_summary(content), "Stdout: first line");
+    }
+
+    #[test]
+    fn tool_preview_uses_first_meaningful_line() {
+        let content = "◀ Tool Result\nOperation completed successfully\nMore details";
+        assert_eq!(
+            tool_preview_summary(content),
+            "Operation completed successfully"
+        );
+    }
 }
 
-fn render_message_lines(msgs: &[Message]) -> (Vec<Line<'static>>, Vec<String>) {
+fn render_message_lines(msgs: &[Message], show_tools: bool) -> (Vec<Line<'static>>, Vec<String>) {
     let mut v = Vec::new();
     let mut t = Vec::new();
     for m in msgs {
-        let (mut lines, mut txts) = lines_for_message(m);
+        let (mut lines, mut txts) = lines_for_message(m, show_tools);
         v.append(&mut lines);
         t.append(&mut txts);
     }
@@ -1310,11 +1444,44 @@ fn main() -> Result<()> {
                     }
                     app.selected = 0;
                     app.top = 0;
+                    app.first_msg_pending
+                        .retain(|id| app.all_rows.iter().any(|r| &r.id == id));
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     app.update_rx = None;
                     app.updating_in_progress = false;
+                }
+            }
+        }
+        // Apply async first message results
+        if let Some(rx) = &app.first_msg_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        let FirstMsgResult {
+                            id,
+                            first_msg,
+                            messages,
+                        } = result;
+                        app.first_msg_pending.remove(&id);
+                        if !messages.is_empty() {
+                            app.messages_cache.insert(id.clone(), messages);
+                        }
+                        if let Some(first) = first_msg {
+                            if let Some(row) = app.all_rows.iter_mut().find(|r| r.id == id) {
+                                row.first_msg = first.clone();
+                            }
+                            if let Some(row) = app.rows.iter_mut().find(|r| r.id == id) {
+                                row.first_msg = first;
+                            }
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        app.first_msg_rx = None;
+                        break;
+                    }
                 }
             }
         }
@@ -1507,23 +1674,30 @@ fn main() -> Result<()> {
                             KeyCode::Down if !app.show_settings_modal => {
                                 if app.selected + 1 < app.rows.len() {
                                     app.selected += 1;
-                                    let view_h =
-                                        (terminal.size().unwrap().height.max(4) - 4) as usize;
-                                    if app.selected >= app.top + view_h {
-                                        app.top = app.selected - view_h + 1;
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = list_visible_height(size.height);
+                                        if app.selected >= app.top + view_h {
+                                            app.top = app
+                                                .selected
+                                                .saturating_sub(view_h.saturating_sub(1));
+                                        }
                                     }
                                 }
                             }
                             KeyCode::PageUp => {
-                                let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize;
-                                app.selected = app.selected.saturating_sub(view_h);
-                                app.top = app.top.saturating_sub(view_h);
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = list_visible_height(size.height);
+                                    app.selected = app.selected.saturating_sub(view_h);
+                                    adjust_list_window(&mut app, view_h);
+                                }
                             }
                             KeyCode::PageDown => {
-                                let view_h = (terminal.size().unwrap().height.max(4) - 4) as usize;
-                                app.selected =
-                                    (app.selected + view_h).min(app.rows.len().saturating_sub(1));
-                                app.top = (app.top + view_h).min(app.rows.len().saturating_sub(1));
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = list_visible_height(size.height);
+                                    let last_index = app.rows.len().saturating_sub(1);
+                                    app.selected = (app.selected + view_h).min(last_index);
+                                    adjust_list_window(&mut app, view_h);
+                                }
                             }
                             KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => {
                                 app.selected = 0;
@@ -1532,9 +1706,10 @@ fn main() -> Result<()> {
                             KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
                                 if !app.rows.is_empty() {
                                     app.selected = app.rows.len() - 1;
-                                    let view_h =
-                                        (terminal.size().unwrap().height.max(4) - 4) as usize;
-                                    app.top = app.selected.saturating_sub(view_h.saturating_sub(1));
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = list_visible_height(size.height);
+                                        adjust_list_window(&mut app, view_h);
+                                    }
                                 }
                             }
                             KeyCode::Enter => {
@@ -1551,7 +1726,9 @@ fn main() -> Result<()> {
                                             Err(_) => Vec::new(),
                                         }
                                     };
-                                    let (lines, text) = render_message_lines(&msgs);
+                                    app.view_show_tools = false;
+                                    let (lines, text) =
+                                        render_message_lines(&msgs, app.view_show_tools);
                                     app.view_lines = lines;
                                     app.view_text = text;
                                     app.view_scroll = 0;
@@ -1560,13 +1737,8 @@ fn main() -> Result<()> {
                                     app.search_index = 0;
                                     app.mode = Mode::View;
                                     if let Ok(size) = terminal.size() {
-                                        let view_height = size.height.saturating_sub(4) as usize;
-                                        if view_height > 0 {
-                                            let max_scroll =
-                                                app.view_lines.len().saturating_sub(view_height);
-                                            app.view_scroll =
-                                                max_scroll.min(u16::MAX as usize) as u16;
-                                        }
+                                        let view_height = view_visible_height(size.height);
+                                        set_view_scroll(&mut app, usize::MAX, view_height);
                                     }
                                 }
                             }
@@ -1616,30 +1788,109 @@ fn main() -> Result<()> {
                                 app.search_input = false;
                             }
                             KeyCode::Up => {
-                                app.view_scroll = app.view_scroll.saturating_sub(1);
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = view_visible_height(size.height);
+                                    let current = usize::from(app.view_scroll);
+                                    set_view_scroll(&mut app, current.saturating_sub(1), view_h);
+                                } else {
+                                    app.view_scroll = app.view_scroll.saturating_sub(1);
+                                }
                             }
                             KeyCode::Down => {
-                                app.view_scroll = app.view_scroll.saturating_add(1);
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = view_visible_height(size.height);
+                                    let current = usize::from(app.view_scroll);
+                                    set_view_scroll(&mut app, current.saturating_add(1), view_h);
+                                } else {
+                                    app.view_scroll = app.view_scroll.saturating_add(1);
+                                }
                             }
                             KeyCode::PageUp => {
-                                let h = terminal.size().unwrap().height.saturating_sub(4);
-                                app.view_scroll = app.view_scroll.saturating_sub(h);
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = view_visible_height(size.height);
+                                    let current = usize::from(app.view_scroll);
+                                    set_view_scroll(
+                                        &mut app,
+                                        current.saturating_sub(view_h),
+                                        view_h,
+                                    );
+                                }
                             }
                             KeyCode::PageDown => {
-                                let h = terminal.size().unwrap().height.saturating_sub(4);
-                                app.view_scroll = app.view_scroll.saturating_add(h);
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = view_visible_height(size.height);
+                                    let current = usize::from(app.view_scroll);
+                                    set_view_scroll(
+                                        &mut app,
+                                        current.saturating_add(view_h),
+                                        view_h,
+                                    );
+                                }
                             }
                             KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => {
-                                app.view_scroll = 0;
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = view_visible_height(size.height);
+                                    set_view_scroll(&mut app, 0, view_h);
+                                } else {
+                                    app.view_scroll = 0;
+                                }
                             }
                             KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
-                                let h = terminal.size().unwrap().height.saturating_sub(4);
-                                let max = app.view_lines.len().saturating_sub(h as usize);
-                                app.view_scroll = max as u16;
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = view_visible_height(size.height);
+                                    set_view_scroll(&mut app, usize::MAX, view_h);
+                                }
                             }
                             KeyCode::Char('/') => {
                                 app.search_input = true;
                                 app.search_query.clear();
+                            }
+                            KeyCode::Char('t') if !app.is_input_active() => {
+                                app.view_show_tools = !app.view_show_tools;
+                                if let Some(id) = app.rows.get(app.selected).map(|r| r.id.clone()) {
+                                    if !app.messages_cache.contains_key(&id) {
+                                        if let Ok((_, msgs)) = app.reader.get_messages_by_id(&id) {
+                                            app.messages_cache.insert(id.clone(), msgs);
+                                        }
+                                    }
+                                    if let Some(msgs) = app.messages_cache.get(&id) {
+                                        let (lines, text) =
+                                            render_message_lines(msgs, app.view_show_tools);
+                                        app.view_lines = lines;
+                                        app.view_text = text;
+                                        if !app.search_query.is_empty() {
+                                            let needle = app.search_query.to_lowercase();
+                                            let matches: Vec<usize> = app
+                                                .view_text
+                                                .iter()
+                                                .enumerate()
+                                                .filter_map(|(i, line)| {
+                                                    if line.to_lowercase().contains(&needle) {
+                                                        Some(i)
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect();
+                                            if matches.is_empty() {
+                                                app.search_matches.clear();
+                                                app.search_index = 0;
+                                            } else {
+                                                app.search_matches = matches;
+                                                app.search_index = app
+                                                    .search_index
+                                                    .min(app.search_matches.len() - 1);
+                                            }
+                                        }
+                                        if let Ok(size) = terminal.size() {
+                                            let view_h = view_visible_height(size.height);
+                                            let current = usize::from(app.view_scroll);
+                                            set_view_scroll(&mut app, current, view_h);
+                                        } else if app.view_lines.is_empty() {
+                                            app.view_scroll = 0;
+                                        }
+                                    }
+                                }
                             }
                             KeyCode::Enter if app.search_input => {
                                 // compute matches
@@ -1653,7 +1904,13 @@ fn main() -> Result<()> {
                                         }
                                     }
                                     if let Some(&line_idx) = app.search_matches.first() {
-                                        app.view_scroll = line_idx as u16;
+                                        if let Ok(size) = terminal.size() {
+                                            let view_h = view_visible_height(size.height);
+                                            set_view_scroll(&mut app, line_idx, view_h);
+                                        } else {
+                                            app.view_scroll =
+                                                line_idx.min(u16::MAX as usize) as u16;
+                                        }
                                     }
                                 }
                                 app.search_input = false;
@@ -1664,7 +1921,12 @@ fn main() -> Result<()> {
                                 app.search_index =
                                     (app.search_index + 1) % app.search_matches.len();
                                 let line_idx = app.search_matches[app.search_index];
-                                app.view_scroll = line_idx as u16;
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = view_visible_height(size.height);
+                                    set_view_scroll(&mut app, line_idx, view_h);
+                                } else {
+                                    app.view_scroll = line_idx.min(u16::MAX as usize) as u16;
+                                }
                             }
                             KeyCode::Char('N')
                                 if !app.is_input_active() && !app.search_matches.is_empty() =>
@@ -1675,7 +1937,12 @@ fn main() -> Result<()> {
                                     app.search_index -= 1;
                                 }
                                 let line_idx = app.search_matches[app.search_index];
-                                app.view_scroll = line_idx as u16;
+                                if let Ok(size) = terminal.size() {
+                                    let view_h = view_visible_height(size.height);
+                                    set_view_scroll(&mut app, line_idx, view_h);
+                                } else {
+                                    app.view_scroll = line_idx.min(u16::MAX as usize) as u16;
+                                }
                             }
                             KeyCode::Char(c) if app.search_input => {
                                 app.search_query.push(c);
@@ -1723,6 +1990,37 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn spawn_first_msg_loader(
+    projects_dir: PathBuf,
+) -> (Sender<FirstMsgRequest>, Receiver<FirstMsgResult>) {
+    let (req_tx, req_rx) = mpsc::channel::<FirstMsgRequest>();
+    let (res_tx, res_rx) = mpsc::channel::<FirstMsgResult>();
+    thread::spawn(move || {
+        let reader = ChatReader::with_projects_dir(projects_dir);
+        while let Ok(req) = req_rx.recv() {
+            let result = match reader.get_messages_by_path(&req.file_path) {
+                Ok((_, messages)) => {
+                    let first_msg = first_nonempty_text(&messages);
+                    FirstMsgResult {
+                        id: req.id,
+                        first_msg,
+                        messages,
+                    }
+                }
+                Err(_) => FirstMsgResult {
+                    id: req.id,
+                    first_msg: None,
+                    messages: Vec::new(),
+                },
+            };
+            if res_tx.send(result).is_err() {
+                break;
+            }
+        }
+    });
+    (req_tx, res_rx)
+}
+
 fn ensure_first_msgs(app: &mut App, area: Rect) {
     // Visible body height = total - (title 2 + header 1 + footer 1)
     if app.rows.is_empty() {
@@ -1733,18 +2031,29 @@ fn ensure_first_msgs(app: &mut App, area: Rect) {
     for i in app.top..end {
         if app.rows[i].first_msg.is_empty() {
             let id = app.rows[i].id.clone();
-            // Try cache first
-            let msg_opt = app.messages_cache.get(&id).cloned().or_else(|| {
-                if let Ok((_, m)) = app.reader.get_messages_by_id(&id) {
-                    app.messages_cache.insert(id.clone(), m.clone());
-                    Some(m)
-                } else {
-                    None
+            if let Some(msgs) = app.messages_cache.get(&id) {
+                if let Some(first) = first_nonempty_text(msgs) {
+                    let first_str = first.clone();
+                    if let Some(row) = app.all_rows.iter_mut().find(|r| r.id == id) {
+                        row.first_msg = first.clone();
+                    }
+                    app.rows[i].first_msg = first_str;
+                    app.first_msg_pending.remove(&id);
+                    continue;
                 }
-            });
-            if let Some(msgs) = msg_opt {
-                if let Some(first) = first_nonempty_text(&msgs) {
-                    app.rows[i].first_msg = first;
+            }
+            if app.first_msg_pending.contains(&id) {
+                continue;
+            }
+            if let Some(tx) = app.first_msg_tx.as_ref() {
+                let req = FirstMsgRequest {
+                    id: id.clone(),
+                    file_path: app.rows[i].file_path.clone(),
+                };
+                if tx.send(req).is_ok() {
+                    app.first_msg_pending.insert(id);
+                } else {
+                    app.first_msg_tx = None;
                 }
             }
         }
@@ -1752,23 +2061,30 @@ fn ensure_first_msgs(app: &mut App, area: Rect) {
 }
 
 fn first_nonempty_text(msgs: &[Message]) -> Option<String> {
-    // Prefer the first non-empty USER message
-    for m in msgs {
-        if m.role == "user" {
-            let t = m.content.trim();
-            if !t.is_empty() {
-                return Some(single_line_preview(t, 240));
-            }
-        }
+    // Prefer the latest non-empty ASSISTANT message so previews mirror
+    // the final response when no summary metadata exists.
+    if let Some(m) = msgs
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+    {
+        return Some(single_line_preview(m.content.trim(), 240));
     }
-    // Fallback to any first non-empty message
-    for m in msgs {
-        let t = m.content.trim();
-        if !t.is_empty() {
-            return Some(single_line_preview(t, 240));
-        }
+
+    // Otherwise, fall back to the first non-empty USER message to surface the
+    // original request when we cannot show the reply.
+    if let Some(m) = msgs
+        .iter()
+        .find(|m| m.role == "user" && !m.content.trim().is_empty())
+    {
+        return Some(single_line_preview(m.content.trim(), 240));
     }
-    None
+
+    // Finally, return the first non-empty message regardless of role.
+    msgs.iter()
+        .map(|m| m.content.trim())
+        .find(|t| !t.is_empty())
+        .map(|t| single_line_preview(t, 240))
 }
 
 fn single_line_preview(s: &str, max_chars: usize) -> String {

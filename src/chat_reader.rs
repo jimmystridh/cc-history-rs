@@ -3,7 +3,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use similar::TextDiff;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -244,11 +243,12 @@ impl ChatReader {
                     let mut summary: Option<String> = None;
                     let mut cwd = None;
                     let mut created_at = None;
-                    let mut last_assistant: Option<String> = None;
 
                     for line_str in reader.lines().flatten() {
                         if let Ok(v) = serde_json::from_str::<Value>(&line_str) {
-                            if v.get("type").and_then(|x| x.as_str()) == Some("summary") {
+                            if summary.is_none()
+                                && v.get("type").and_then(|x| x.as_str()) == Some("summary")
+                            {
                                 summary = v
                                     .get("summary")
                                     .and_then(|x| x.as_str())
@@ -265,21 +265,11 @@ impl ChatReader {
                                 }
                             }
 
-                            let message_val = v.get("message").cloned().unwrap_or(v.clone());
-                            if let Some(role_raw) = extract_role(&message_val) {
-                                let role = normalize_role(&role_raw);
-                                if role == "assistant" {
-                                    if let Some(content) = extract_text(&message_val) {
-                                        let trimmed = content.trim();
-                                        if !trimmed.is_empty() {
-                                            last_assistant = Some(trimmed.to_string());
-                                        }
-                                    }
-                                }
+                            if cwd.is_some() && created_at.is_some() {
+                                break;
                             }
                         }
                     }
-                    summary = summary.or(last_assistant);
                     (summary, cwd, created_at)
                 } else {
                     (None, None, None)
@@ -297,7 +287,6 @@ impl ChatReader {
     }
 
     pub fn get_messages_by_id(&self, id: &str) -> Result<(ConversationMeta, Vec<Message>)> {
-        // find file
         let projects = self.projects_root.clone();
         let mut found: Option<PathBuf> = None;
         for entry in WalkDir::new(&projects)
@@ -315,13 +304,28 @@ impl ChatReader {
             }
         }
         let file = found.ok_or_else(|| anyhow!("Conversation not found: {}", id))?;
-        let f = File::open(&file).with_context(|| format!("open {}", file.display()))?;
+        Self::parse_conversation_file(&file)
+    }
+
+    pub fn get_messages_by_path<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(ConversationMeta, Vec<Message>)> {
+        Self::parse_conversation_file(path.as_ref())
+    }
+
+    fn parse_conversation_file(path: &Path) -> Result<(ConversationMeta, Vec<Message>)> {
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("Invalid conversation file: {}", path.display()))?
+            .to_string();
+        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut msgs = Vec::new();
         let mut summary: Option<String> = None;
         let mut meta_cwd: Option<String> = None;
         let mut meta_created_at: Option<i64> = None;
 
-        // Helper to flush any accumulated streaming content (call when not actively streaming)
         fn flush_stream(
             msgs: &mut Vec<Message>,
             stream_role: &mut Option<String>,
@@ -338,13 +342,9 @@ impl ChatReader {
             }
         }
 
-        // Streaming reconstruction state for assistant messages
         let mut stream_role: Option<String> = None;
         let mut stream_buf = String::new();
         let mut streaming = false;
-
-        // Track tool_use id -> name for pretty rendering of results
-        let mut tool_names: HashMap<String, String> = HashMap::new();
 
         for line in BufReader::new(f).lines() {
             let line = line?;
@@ -381,9 +381,6 @@ impl ChatReader {
                 }
             }
 
-            // (helper declared above)
-
-            // 1) Direct message entries (skip streaming events)
             let is_streaming_event = v
                 .get("type")
                 .and_then(|t| t.as_str())
@@ -403,7 +400,6 @@ impl ChatReader {
                     || v.get("role").is_some()
                     || v.get("content").is_some())
             {
-                // End any previous stream before pushing a discrete message
                 if streaming {
                     streaming = false;
                 }
@@ -412,18 +408,14 @@ impl ChatReader {
                 let mval = v.get("message").cloned().unwrap_or(v.clone());
                 let role = extract_role(&mval).unwrap_or_else(|| "assistant".into());
 
-                // If message has structured content, render tool calls/results prettily
                 if let Some(arr) = mval.get("content").and_then(|x| x.as_array()) {
+                    let mut pushed_any = false;
                     for item in arr {
                         if let Some(obj) = item.as_object() {
                             match obj.get("type").and_then(|x| x.as_str()) {
                                 Some("tool_use") => {
-                                    let id = obj.get("id").and_then(|x| x.as_str()).unwrap_or("");
                                     let name =
                                         obj.get("name").and_then(|x| x.as_str()).unwrap_or("tool");
-                                    if !id.is_empty() {
-                                        tool_names.insert(id.to_string(), name.to_string());
-                                    }
                                     let mut pretty = String::new();
                                     if let Some(inp) = obj.get("input").and_then(|x| x.as_object())
                                     {
@@ -488,10 +480,10 @@ impl ChatReader {
                                             role: "assistant".into(),
                                             content: pretty,
                                         });
+                                        pushed_any = true;
                                     }
                                 }
                                 Some("tool_result") => {
-                                    // Collate tool result body; only push if actual content present
                                     let mut body = String::new();
                                     if let Some(txt) = obj.get("content").and_then(|x| x.as_str()) {
                                         if !txt.trim().is_empty() {
@@ -507,16 +499,17 @@ impl ChatReader {
                                             role: "tool".into(),
                                             content: pretty,
                                         });
+                                        pushed_any = true;
                                     }
                                 }
                                 _ => {
-                                    // Fallback to text extraction per item
                                     if let Some(txt) = obj.get("text").and_then(|x| x.as_str()) {
                                         if !txt.trim().is_empty() {
                                             msgs.push(Message {
                                                 role: normalize_role(&role),
                                                 content: txt.to_string(),
                                             });
+                                            pushed_any = true;
                                         }
                                     }
                                 }
@@ -527,10 +520,48 @@ impl ChatReader {
                                     role: normalize_role(&role),
                                     content: s.to_string(),
                                 });
+                                pushed_any = true;
                             }
                         }
                     }
-                    // If top-level includes a structured toolUseResult, include stdout/stderr
+                    if let Some(tr) = v.get("toolUseResult").and_then(|x| x.as_object()) {
+                        let mut body = String::new();
+                        if let Some(out) = tr.get("stdout").and_then(|x| x.as_str()) {
+                            if !out.trim().is_empty() {
+                                body.push_str("Stdout:\n\n```");
+                                body.push('\n');
+                                body.push_str(out);
+                                body.push_str("\n```\n");
+                            }
+                        }
+                        if let Some(err) = tr.get("stderr").and_then(|x| x.as_str()) {
+                            if !err.trim().is_empty() {
+                                body.push_str("Stderr:\n\n```");
+                                body.push('\n');
+                                body.push_str(err);
+                                body.push_str("\n```\n");
+                            }
+                        }
+                        if !body.trim().is_empty() {
+                            let mut pretty = String::from("◀ Tool Result\n\n");
+                            pretty.push_str(&body);
+                            msgs.push(Message {
+                                role: "tool".into(),
+                                content: pretty,
+                            });
+                            pushed_any = true;
+                        }
+                    }
+                    if !pushed_any {
+                        let content = extract_text(&mval).unwrap_or_default();
+                        if !content.trim().is_empty() {
+                            msgs.push(Message {
+                                role: normalize_role(&role),
+                                content,
+                            });
+                        }
+                    }
+                } else {
                     if let Some(tr) = v.get("toolUseResult").and_then(|x| x.as_object()) {
                         let mut body = String::new();
                         if let Some(out) = tr.get("stdout").and_then(|x| x.as_str()) {
@@ -557,24 +588,20 @@ impl ChatReader {
                                 content: pretty,
                             });
                         }
-                    } else {
-                        // Fallback plain text
-                        let content = extract_text(&mval).unwrap_or_default();
-                        if !content.trim().is_empty() {
-                            msgs.push(Message {
-                                role: normalize_role(&role),
-                                content,
-                            });
-                        }
+                    }
+                    let content = extract_text(&mval).unwrap_or_default();
+                    if !content.trim().is_empty() {
+                        msgs.push(Message {
+                            role: normalize_role(&role),
+                            content,
+                        });
                     }
                 }
                 continue;
             }
 
-            // 2) Event-stream style entries
             if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
                 match t {
-                    // Start of an assistant message
                     "message_start" => {
                         streaming = true;
                         stream_buf.clear();
@@ -583,7 +610,6 @@ impl ChatReader {
                             .and_then(extract_role)
                             .or(Some("assistant".into()));
                     }
-                    // Text chunks
                     "content_block_delta" => {
                         if let Some(delta) = v.get("delta") {
                             if let Some(txt) = delta.get("text").and_then(|x| x.as_str()) {
@@ -591,7 +617,6 @@ impl ChatReader {
                             }
                         }
                     }
-                    // Some logs include initial text in content_block_start
                     "content_block_start" => {
                         if let Some(cb) = v.get("content_block") {
                             if let Some(txt) = cb.get("text").and_then(|x| x.as_str()) {
@@ -599,20 +624,16 @@ impl ChatReader {
                             }
                         }
                     }
-                    // End of an assistant message
                     "message_stop" => {
                         streaming = false;
                         flush_stream(&mut msgs, &mut stream_role, &mut stream_buf);
                     }
-                    _ => { /* ignore other event types */ }
+                    _ => {}
                 }
                 continue;
             }
-
-            // 3) Fallback: ignore unknown rows
         }
 
-        // Flush any dangling stream buffer
         if streaming {
             flush_stream(&mut msgs, &mut stream_role, &mut stream_buf);
         }
@@ -626,10 +647,10 @@ impl ChatReader {
             }
         }
         let meta = ConversationMeta {
-            id: id.to_string(),
+            id,
             path: meta_cwd,
             created_at: meta_created_at,
-            file,
+            file: path.to_path_buf(),
             summary,
         };
         Ok((meta, msgs))
@@ -707,4 +728,45 @@ pub fn sort_conversations_by_earliest(convos: &mut [ConversationMeta]) {
             (None, None) => Ordering::Equal,
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::Builder;
+
+    fn write_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
+        let mut file = Builder::new()
+            .prefix("cc-history-test-")
+            .suffix(".jsonl")
+            .tempfile()
+            .expect("create temp jsonl");
+        for line in lines {
+            writeln!(file, "{}", line).expect("write jsonl line");
+        }
+        file.flush().expect("flush temp file");
+        file
+    }
+
+    #[test]
+    fn parses_user_and_assistant_messages_without_duplicates() {
+        let file = write_jsonl(&[
+            r#"{"type":"user","message":{"role":"user","content":"List all available Skills\n"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"There are currently no Skills available."}]}}"#,
+        ]);
+
+        let (_, messages) = ChatReader::parse_conversation_file(file.path()).expect("parse file");
+
+        let user_msgs: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(user_msgs.len(), 1, "expected one user message");
+        assert!(user_msgs[0].content.contains("List all available Skills"));
+
+        let assistant_msgs: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(assistant_msgs.len(), 1, "expected one assistant message");
+        assert_eq!(
+            assistant_msgs[0].content.trim(),
+            "There are currently no Skills available."
+        );
+    }
 }
