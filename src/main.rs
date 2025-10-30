@@ -19,7 +19,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -300,16 +300,21 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
         return (out, texts);
     }
 
+    let is_tool = msg.role.contains("tool");
+
     let (prefix, title, header_text) = if msg.role == "user" {
         (
             Span::styled("You  » ", Style::default().fg(Color::Green)),
             Span::styled("You", Style::default().fg(Color::Green)),
             "You:",
         )
-    } else if msg.role.contains("tool") {
+    } else if is_tool {
         (
-            Span::styled("Tool « ", Style::default().fg(Color::Yellow)),
-            Span::styled("Tool Result", Style::default().fg(Color::Yellow)),
+            Span::styled("Tool « ", Style::default().fg(Color::Rgb(180, 180, 180))),
+            Span::styled(
+                "Tool Result",
+                Style::default().fg(Color::Rgb(200, 200, 200)),
+            ),
             "Tool Result:",
         )
     } else {
@@ -326,7 +331,7 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
     ]));
     texts.push(header_text.to_string());
 
-    if msg.role.contains("tool") && !show_tools {
+    if is_tool && !show_tools {
         let preview = tool_preview_summary(trimmed);
         let summary = format!("[tool result] {}  (t to expand)", preview);
         out.push(Line::from(vec![
@@ -334,7 +339,10 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
                 CODE_INDENT.to_string(),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(summary.clone(), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                summary.clone(),
+                Style::default().fg(Color::Rgb(200, 200, 200)),
+            ),
         ]));
         texts.push(format!("{}{}", CODE_INDENT, summary));
         return (out, texts);
@@ -355,7 +363,7 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
                         &mut texts,
                         &code_buffer,
                         code_lang.as_deref(),
-                        msg.role.contains("tool"),
+                        is_tool,
                     );
                     code_buffer.clear();
                     code_lang = None;
@@ -384,7 +392,15 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
                 CODE_INDENT.to_string(),
                 Style::default().fg(Color::DarkGray),
             ));
-            spans.push(Span::raw(raw_line.to_string()));
+            let content_span = if is_tool {
+                Span::styled(
+                    raw_line.to_string(),
+                    Style::default().fg(Color::Rgb(200, 200, 200)),
+                )
+            } else {
+                Span::raw(raw_line.to_string())
+            };
+            spans.push(content_span);
             out.push(Line::from(spans));
         }
     }
@@ -395,7 +411,7 @@ fn lines_for_message(msg: &Message, show_tools: bool) -> (Vec<Line<'static>>, Ve
             &mut texts,
             &code_buffer,
             code_lang.as_deref(),
-            msg.role.contains("tool"),
+            is_tool,
         );
     }
 
@@ -1700,7 +1716,7 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let tick_rate = Duration::from_millis(200);
-    let mut last_tick = Instant::now();
+    let mut needs_redraw = true;
 
     loop {
         // Apply async sort results if available
@@ -1710,11 +1726,13 @@ fn main() -> Result<()> {
                     app.rows = new_rows;
                     app.sort_rx = None;
                     app.sorting_in_progress = false;
+                    needs_redraw = true;
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     app.sort_rx = None;
                     app.sorting_in_progress = false;
+                    needs_redraw = true;
                 }
             }
         }
@@ -1727,11 +1745,13 @@ fn main() -> Result<()> {
                     app.list_search_in_progress = false;
                     app.selected = 0;
                     app.top = 0;
+                    needs_redraw = true;
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     app.list_search_rx = None;
                     app.list_search_in_progress = false;
+                    needs_redraw = true;
                 }
             }
         }
@@ -1758,11 +1778,13 @@ fn main() -> Result<()> {
                     app.top = 0;
                     app.first_msg_pending
                         .retain(|id| app.all_rows.iter().any(|r| &r.id == id));
+                    needs_redraw = true;
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     app.update_rx = None;
                     app.updating_in_progress = false;
+                    needs_redraw = true;
                 }
             }
         }
@@ -1788,10 +1810,12 @@ fn main() -> Result<()> {
                                 row.first_msg = first;
                             }
                         }
+                        needs_redraw = true;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         app.first_msg_rx = None;
+                        needs_redraw = true;
                         break;
                     }
                 }
@@ -1801,6 +1825,7 @@ fn main() -> Result<()> {
         if let Some(prx) = &app.fs_ping_rx {
             if prx.try_recv().is_ok() && !app.updating_in_progress {
                 spawn_full_refresh(&mut app);
+                needs_redraw = true;
             }
         }
 
@@ -1832,6 +1857,7 @@ fn main() -> Result<()> {
                             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
                         )?;
                         terminal.clear()?;
+                        needs_redraw = true;
                         // Continue the main loop
                     }
                 }
@@ -1843,452 +1869,475 @@ fn main() -> Result<()> {
             }
         }
 
-        // Precompute size for lazy loading of first message previews
-        if let Ok(sz) = terminal.size() {
-            if let Mode::List = app.mode {
-                ensure_first_msgs(&mut app, sz);
+        if needs_redraw {
+            // Precompute size for lazy loading of first message previews
+            if let Ok(sz) = terminal.size() {
+                if let Mode::List = app.mode {
+                    ensure_first_msgs(&mut app, sz);
+                }
             }
-        }
-        terminal.draw(|f| {
-            let size = f.size();
-            match app.mode {
-                Mode::List => render_list(f, size, &app),
-                Mode::View => render_view(f, size, &app),
-            }
-            if app.show_info_modal {
-                render_info_modal(f, size, &app);
-            }
-            if app.show_settings_modal {
-                render_settings_modal(f, size, &app);
-            }
-        })?;
-
-        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        if crossterm::event::poll(timeout)? {
-            if let Event::Key(KeyEvent {
-                code, modifiers, ..
-            }) = event::read()?
-            {
+            terminal.draw(|f| {
+                let size = f.size();
                 match app.mode {
-                    Mode::List => {
-                        match code {
-                            // Quit
-                            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                                break
-                            }
-                            KeyCode::Char('q') if !app.list_search_input => break,
-                            // Cancel search input or close modals (do not quit)
-                            KeyCode::Esc if app.list_search_input => {
-                                app.list_search_input = false;
-                            }
-                            KeyCode::Esc if app.show_info_modal => {
-                                app.show_info_modal = false;
-                            }
-                            KeyCode::Esc if app.show_settings_modal => {
-                                // Cancel all changes and close modal
-                                app.show_settings_modal = false;
-                                app.settings_selected_field = 0;
-                                // Reload original values
-                                app.settings_claude_command = load_claude_command_pref();
-                                app.settings_quit_after_launch = load_quit_after_launch_pref();
-                            }
-                            KeyCode::Char('s') if !app.is_input_active() => {
-                                cycle_sort_key(&mut app);
-                                let _ = save_sort_prefs(app.sort_key, app.sort_desc);
-                                spawn_sort(&mut app);
-                            }
-                            KeyCode::Char('o') if !app.is_input_active() => {
-                                app.sort_desc = !app.sort_desc;
-                                let _ = save_sort_prefs(app.sort_key, app.sort_desc);
-                                spawn_sort(&mut app);
-                            }
-                            KeyCode::Char('w') if !app.is_input_active() => {
-                                // toggle watcher
-                                if app.watcher_enabled {
-                                    app.fs_ping_rx = None;
-                                    app.watcher_enabled = false;
-                                } else {
-                                    spawn_fs_watcher(&mut app);
-                                    app.watcher_enabled = app.fs_ping_rx.is_some();
+                    Mode::List => render_list(f, size, &app),
+                    Mode::View => render_view(f, size, &app),
+                }
+                if app.show_info_modal {
+                    render_info_modal(f, size, &app);
+                }
+                if app.show_settings_modal {
+                    render_settings_modal(f, size, &app);
+                }
+            })?;
+            needs_redraw = false;
+        }
+
+        if crossterm::event::poll(tick_rate)? {
+            match event::read()? {
+                Event::Key(KeyEvent {
+                    code, modifiers, ..
+                }) => {
+                    needs_redraw = true;
+                    match app.mode {
+                        Mode::List => {
+                            match code {
+                                // Quit
+                                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                    break
                                 }
-                                let _ = save_watcher_pref(app.watcher_enabled);
-                            }
-                            KeyCode::Char('i') if !app.is_input_active() => {
-                                app.show_info_modal = true;
-                            }
-                            KeyCode::Char(',') if !app.is_input_active() => {
-                                app.show_settings_modal = true;
-                                app.settings_selected_field = 0;
-                                app.settings_claude_command = load_claude_command_pref();
-                                app.settings_quit_after_launch = load_quit_after_launch_pref();
-                            }
-                            KeyCode::Char('r') if !app.is_input_active() => {
-                                if let Some(row) = app.rows.get(app.selected) {
-                                    app.resume_session_request =
-                                        Some((row.id.clone(), row.path.clone()));
+                                KeyCode::Char('q') if !app.list_search_input => break,
+                                // Cancel search input or close modals (do not quit)
+                                KeyCode::Esc if app.list_search_input => {
+                                    app.list_search_input = false;
                                 }
-                            }
-                            KeyCode::Char('/') => {
-                                app.list_search_input = true;
-                                app.list_search_query.clear();
-                            }
-                            KeyCode::Enter if app.list_search_input => {
-                                spawn_list_search(&mut app);
-                                app.list_search_input = false;
-                            }
-                            KeyCode::Backspace if app.list_search_input => {
-                                app.list_search_query.pop();
-                            }
-                            KeyCode::Char(c) if app.list_search_input => {
-                                app.list_search_query.push(c);
-                            }
-                            // Settings modal input handling
-                            KeyCode::Enter if app.show_settings_modal => {
-                                // Save all settings and close modal
-                                let _ = save_claude_command_pref(&app.settings_claude_command);
-                                let _ = save_quit_after_launch_pref(app.settings_quit_after_launch);
-                                app.show_settings_modal = false;
-                                app.settings_selected_field = 0;
-                            }
-                            KeyCode::Up if app.show_settings_modal => {
-                                if app.settings_selected_field > 0 {
-                                    app.settings_selected_field -= 1;
+                                KeyCode::Esc if app.show_info_modal => {
+                                    app.show_info_modal = false;
                                 }
-                            }
-                            KeyCode::Down if app.show_settings_modal => {
-                                if app.settings_selected_field < 1 {
-                                    app.settings_selected_field += 1;
+                                KeyCode::Esc if app.show_settings_modal => {
+                                    // Cancel all changes and close modal
+                                    app.show_settings_modal = false;
+                                    app.settings_selected_field = 0;
+                                    // Reload original values
+                                    app.settings_claude_command = load_claude_command_pref();
+                                    app.settings_quit_after_launch = load_quit_after_launch_pref();
                                 }
-                            }
-                            KeyCode::Backspace
-                                if app.show_settings_modal && app.settings_selected_field == 0 =>
-                            {
-                                app.settings_claude_command.pop();
-                            }
-                            KeyCode::Char(c)
-                                if app.show_settings_modal && app.settings_selected_field == 0 =>
-                            {
-                                app.settings_claude_command.push(c);
-                            }
-                            KeyCode::Char(' ') | KeyCode::Char('y') | KeyCode::Char('n')
-                                if app.show_settings_modal && app.settings_selected_field == 1 =>
-                            {
-                                app.settings_quit_after_launch = !app.settings_quit_after_launch;
-                            }
-                            KeyCode::Up if !app.show_settings_modal => {
-                                if app.selected > 0 {
-                                    app.selected -= 1;
-                                    if app.selected < app.top {
-                                        app.top = app.selected;
+                                KeyCode::Char('s') if !app.is_input_active() => {
+                                    cycle_sort_key(&mut app);
+                                    let _ = save_sort_prefs(app.sort_key, app.sort_desc);
+                                    spawn_sort(&mut app);
+                                }
+                                KeyCode::Char('o') if !app.is_input_active() => {
+                                    app.sort_desc = !app.sort_desc;
+                                    let _ = save_sort_prefs(app.sort_key, app.sort_desc);
+                                    spawn_sort(&mut app);
+                                }
+                                KeyCode::Char('w') if !app.is_input_active() => {
+                                    // toggle watcher
+                                    if app.watcher_enabled {
+                                        app.fs_ping_rx = None;
+                                        app.watcher_enabled = false;
+                                    } else {
+                                        spawn_fs_watcher(&mut app);
+                                        app.watcher_enabled = app.fs_ping_rx.is_some();
+                                    }
+                                    let _ = save_watcher_pref(app.watcher_enabled);
+                                }
+                                KeyCode::Char('i') if !app.is_input_active() => {
+                                    app.show_info_modal = true;
+                                }
+                                KeyCode::Char(',') if !app.is_input_active() => {
+                                    app.show_settings_modal = true;
+                                    app.settings_selected_field = 0;
+                                    app.settings_claude_command = load_claude_command_pref();
+                                    app.settings_quit_after_launch = load_quit_after_launch_pref();
+                                }
+                                KeyCode::Char('r') if !app.is_input_active() => {
+                                    if let Some(row) = app.rows.get(app.selected) {
+                                        app.resume_session_request =
+                                            Some((row.id.clone(), row.path.clone()));
                                     }
                                 }
-                            }
-                            KeyCode::Down if !app.show_settings_modal => {
-                                if app.selected + 1 < app.rows.len() {
-                                    app.selected += 1;
-                                    if let Ok(size) = terminal.size() {
-                                        let view_h = list_visible_height(size.height);
-                                        if app.selected >= app.top + view_h {
-                                            app.top = app
-                                                .selected
-                                                .saturating_sub(view_h.saturating_sub(1));
+                                KeyCode::Char('/') => {
+                                    app.list_search_input = true;
+                                    app.list_search_query.clear();
+                                }
+                                KeyCode::Enter if app.list_search_input => {
+                                    spawn_list_search(&mut app);
+                                    app.list_search_input = false;
+                                }
+                                KeyCode::Backspace if app.list_search_input => {
+                                    app.list_search_query.pop();
+                                }
+                                KeyCode::Char(c) if app.list_search_input => {
+                                    app.list_search_query.push(c);
+                                }
+                                // Settings modal input handling
+                                KeyCode::Enter if app.show_settings_modal => {
+                                    // Save all settings and close modal
+                                    let _ = save_claude_command_pref(&app.settings_claude_command);
+                                    let _ =
+                                        save_quit_after_launch_pref(app.settings_quit_after_launch);
+                                    app.show_settings_modal = false;
+                                    app.settings_selected_field = 0;
+                                }
+                                KeyCode::Up if app.show_settings_modal => {
+                                    if app.settings_selected_field > 0 {
+                                        app.settings_selected_field -= 1;
+                                    }
+                                }
+                                KeyCode::Down if app.show_settings_modal => {
+                                    if app.settings_selected_field < 1 {
+                                        app.settings_selected_field += 1;
+                                    }
+                                }
+                                KeyCode::Backspace
+                                    if app.show_settings_modal
+                                        && app.settings_selected_field == 0 =>
+                                {
+                                    app.settings_claude_command.pop();
+                                }
+                                KeyCode::Char(c)
+                                    if app.show_settings_modal
+                                        && app.settings_selected_field == 0 =>
+                                {
+                                    app.settings_claude_command.push(c);
+                                }
+                                KeyCode::Char(' ') | KeyCode::Char('y') | KeyCode::Char('n')
+                                    if app.show_settings_modal
+                                        && app.settings_selected_field == 1 =>
+                                {
+                                    app.settings_quit_after_launch =
+                                        !app.settings_quit_after_launch;
+                                }
+                                KeyCode::Up if !app.show_settings_modal => {
+                                    if app.selected > 0 {
+                                        app.selected -= 1;
+                                        if app.selected < app.top {
+                                            app.top = app.selected;
                                         }
                                     }
                                 }
-                            }
-                            KeyCode::PageUp => {
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = list_visible_height(size.height);
-                                    app.selected = app.selected.saturating_sub(view_h);
-                                    adjust_list_window(&mut app, view_h);
+                                KeyCode::Down if !app.show_settings_modal => {
+                                    if app.selected + 1 < app.rows.len() {
+                                        app.selected += 1;
+                                        if let Ok(size) = terminal.size() {
+                                            let view_h = list_visible_height(size.height);
+                                            if app.selected >= app.top + view_h {
+                                                app.top = app
+                                                    .selected
+                                                    .saturating_sub(view_h.saturating_sub(1));
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                            KeyCode::PageDown => {
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = list_visible_height(size.height);
-                                    let last_index = app.rows.len().saturating_sub(1);
-                                    app.selected = (app.selected + view_h).min(last_index);
-                                    adjust_list_window(&mut app, view_h);
-                                }
-                            }
-                            KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => {
-                                app.selected = 0;
-                                app.top = 0;
-                            }
-                            KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
-                                if !app.rows.is_empty() {
-                                    app.selected = app.rows.len() - 1;
+                                KeyCode::PageUp => {
                                     if let Ok(size) = terminal.size() {
                                         let view_h = list_visible_height(size.height);
+                                        app.selected = app.selected.saturating_sub(view_h);
                                         adjust_list_window(&mut app, view_h);
                                     }
                                 }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(row) = app.rows.get(app.selected) {
-                                    let msgs = if let Some(m) = app.messages_cache.get(&row.id) {
-                                        m.clone()
-                                    } else {
-                                        match app.reader.get_messages_by_id(&row.id) {
-                                            Ok((_, m)) => {
-                                                app.messages_cache
-                                                    .insert(row.id.clone(), m.clone());
-                                                m
-                                            }
-                                            Err(_) => Vec::new(),
-                                        }
-                                    };
-                                    app.view_show_tools = false;
-                                    let (lines, text) =
-                                        render_message_lines(&msgs, app.view_show_tools);
-                                    app.view_lines = lines;
-                                    app.view_text = text;
-                                    app.view_scroll = 0;
-                                    app.search_query.clear();
-                                    app.search_matches.clear();
-                                    app.search_index = 0;
-                                    app.mode = Mode::View;
+                                KeyCode::PageDown => {
                                     if let Ok(size) = terminal.size() {
-                                        let view_height = view_visible_height(size.height);
-                                        set_view_scroll(&mut app, usize::MAX, view_height);
+                                        let view_h = list_visible_height(size.height);
+                                        let last_index = app.rows.len().saturating_sub(1);
+                                        app.selected = (app.selected + view_h).min(last_index);
+                                        adjust_list_window(&mut app, view_h);
                                     }
                                 }
-                            }
-                            KeyCode::Char('f') if !app.is_input_active() => {
-                                if let Some(row) = app.rows.get(app.selected) {
-                                    if !row.path.is_empty() {
-                                        let chosen = row.path.clone();
-                                        app.set_filter(Some(chosen.clone()));
-                                        let _ = save_filter_pref(Some(&chosen));
-                                    }
-                                }
-                            }
-                            KeyCode::Char('x') if !app.is_input_active() => {
-                                app.set_filter(None);
-                                let _ = save_filter_pref(None);
-                                if !app.list_search_query.is_empty() {
-                                    app.list_search_query.clear();
-                                    app.rows = app.all_rows.clone();
+                                KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => {
                                     app.selected = 0;
                                     app.top = 0;
                                 }
-                            }
-                            KeyCode::Char('e') if !app.is_input_active() => {
-                                if let Some(row) = app.rows.get(app.selected) {
-                                    if let Some(msgs) = app.messages_cache.get(&row.id) {
-                                        let title = &row.id;
-                                        if let Ok(path) = export_html(title, &row.path, msgs) {
-                                            let _ = open::that(path);
+                                KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
+                                    if !app.rows.is_empty() {
+                                        app.selected = app.rows.len() - 1;
+                                        if let Ok(size) = terminal.size() {
+                                            let view_h = list_visible_height(size.height);
+                                            adjust_list_window(&mut app, view_h);
                                         }
                                     }
                                 }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Mode::View => {
-                        match code {
-                            KeyCode::Esc if app.show_info_modal => {
-                                app.show_info_modal = false;
-                            }
-                            KeyCode::Char('q') | KeyCode::Esc
-                                if !app.search_input && !app.show_info_modal =>
-                            {
-                                app.mode = Mode::List;
-                            }
-                            KeyCode::Esc if app.search_input => {
-                                app.search_input = false;
-                            }
-                            KeyCode::Up => {
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = view_visible_height(size.height);
-                                    let current = usize::from(app.view_scroll);
-                                    set_view_scroll(&mut app, current.saturating_sub(1), view_h);
-                                } else {
-                                    app.view_scroll = app.view_scroll.saturating_sub(1);
-                                }
-                            }
-                            KeyCode::Down => {
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = view_visible_height(size.height);
-                                    let current = usize::from(app.view_scroll);
-                                    set_view_scroll(&mut app, current.saturating_add(1), view_h);
-                                } else {
-                                    app.view_scroll = app.view_scroll.saturating_add(1);
-                                }
-                            }
-                            KeyCode::PageUp => {
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = view_visible_height(size.height);
-                                    let current = usize::from(app.view_scroll);
-                                    set_view_scroll(
-                                        &mut app,
-                                        current.saturating_sub(view_h),
-                                        view_h,
-                                    );
-                                }
-                            }
-                            KeyCode::PageDown => {
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = view_visible_height(size.height);
-                                    let current = usize::from(app.view_scroll);
-                                    set_view_scroll(
-                                        &mut app,
-                                        current.saturating_add(view_h),
-                                        view_h,
-                                    );
-                                }
-                            }
-                            KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => {
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = view_visible_height(size.height);
-                                    set_view_scroll(&mut app, 0, view_h);
-                                } else {
-                                    app.view_scroll = 0;
-                                }
-                            }
-                            KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = view_visible_height(size.height);
-                                    set_view_scroll(&mut app, usize::MAX, view_h);
-                                }
-                            }
-                            KeyCode::Char('/') => {
-                                app.search_input = true;
-                                app.search_query.clear();
-                            }
-                            KeyCode::Char('t') if !app.is_input_active() => {
-                                app.view_show_tools = !app.view_show_tools;
-                                if let Some(id) = app.rows.get(app.selected).map(|r| r.id.clone()) {
-                                    if !app.messages_cache.contains_key(&id) {
-                                        if let Ok((_, msgs)) = app.reader.get_messages_by_id(&id) {
-                                            app.messages_cache.insert(id.clone(), msgs);
-                                        }
-                                    }
-                                    if let Some(msgs) = app.messages_cache.get(&id) {
+                                KeyCode::Enter => {
+                                    if let Some(row) = app.rows.get(app.selected) {
+                                        let msgs = if let Some(m) = app.messages_cache.get(&row.id)
+                                        {
+                                            m.clone()
+                                        } else {
+                                            match app.reader.get_messages_by_id(&row.id) {
+                                                Ok((_, m)) => {
+                                                    app.messages_cache
+                                                        .insert(row.id.clone(), m.clone());
+                                                    m
+                                                }
+                                                Err(_) => Vec::new(),
+                                            }
+                                        };
+                                        app.view_show_tools = false;
                                         let (lines, text) =
-                                            render_message_lines(msgs, app.view_show_tools);
+                                            render_message_lines(&msgs, app.view_show_tools);
                                         app.view_lines = lines;
                                         app.view_text = text;
-                                        if !app.search_query.is_empty() {
-                                            let needle = app.search_query.to_lowercase();
-                                            let matches: Vec<usize> = app
-                                                .view_text
-                                                .iter()
-                                                .enumerate()
-                                                .filter_map(|(i, line)| {
-                                                    if line.to_lowercase().contains(&needle) {
-                                                        Some(i)
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
-                                                .collect();
-                                            if matches.is_empty() {
-                                                app.search_matches.clear();
-                                                app.search_index = 0;
-                                            } else {
-                                                app.search_matches = matches;
-                                                app.search_index = app
-                                                    .search_index
-                                                    .min(app.search_matches.len() - 1);
+                                        app.view_scroll = 0;
+                                        app.search_query.clear();
+                                        app.search_matches.clear();
+                                        app.search_index = 0;
+                                        app.mode = Mode::View;
+                                        if let Ok(size) = terminal.size() {
+                                            let view_height = view_visible_height(size.height);
+                                            set_view_scroll(&mut app, usize::MAX, view_height);
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('f') if !app.is_input_active() => {
+                                    if let Some(row) = app.rows.get(app.selected) {
+                                        if !row.path.is_empty() {
+                                            let chosen = row.path.clone();
+                                            app.set_filter(Some(chosen.clone()));
+                                            let _ = save_filter_pref(Some(&chosen));
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('x') if !app.is_input_active() => {
+                                    app.set_filter(None);
+                                    let _ = save_filter_pref(None);
+                                    if !app.list_search_query.is_empty() {
+                                        app.list_search_query.clear();
+                                        app.rows = app.all_rows.clone();
+                                        app.selected = 0;
+                                        app.top = 0;
+                                    }
+                                }
+                                KeyCode::Char('e') if !app.is_input_active() => {
+                                    if let Some(row) = app.rows.get(app.selected) {
+                                        if let Some(msgs) = app.messages_cache.get(&row.id) {
+                                            let title = &row.id;
+                                            if let Ok(path) = export_html(title, &row.path, msgs) {
+                                                let _ = open::that(path);
                                             }
                                         }
-                                        if let Ok(size) = terminal.size() {
-                                            let view_h = view_visible_height(size.height);
-                                            let current = usize::from(app.view_scroll);
-                                            set_view_scroll(&mut app, current, view_h);
-                                        } else if app.view_lines.is_empty() {
-                                            app.view_scroll = 0;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Mode::View => {
+                            match code {
+                                KeyCode::Esc if app.show_info_modal => {
+                                    app.show_info_modal = false;
+                                }
+                                KeyCode::Char('q') | KeyCode::Esc
+                                    if !app.search_input && !app.show_info_modal =>
+                                {
+                                    app.mode = Mode::List;
+                                }
+                                KeyCode::Esc if app.search_input => {
+                                    app.search_input = false;
+                                }
+                                KeyCode::Up => {
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = view_visible_height(size.height);
+                                        let current = usize::from(app.view_scroll);
+                                        set_view_scroll(
+                                            &mut app,
+                                            current.saturating_sub(1),
+                                            view_h,
+                                        );
+                                    } else {
+                                        app.view_scroll = app.view_scroll.saturating_sub(1);
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = view_visible_height(size.height);
+                                        let current = usize::from(app.view_scroll);
+                                        set_view_scroll(
+                                            &mut app,
+                                            current.saturating_add(1),
+                                            view_h,
+                                        );
+                                    } else {
+                                        app.view_scroll = app.view_scroll.saturating_add(1);
+                                    }
+                                }
+                                KeyCode::PageUp => {
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = view_visible_height(size.height);
+                                        let current = usize::from(app.view_scroll);
+                                        set_view_scroll(
+                                            &mut app,
+                                            current.saturating_sub(view_h),
+                                            view_h,
+                                        );
+                                    }
+                                }
+                                KeyCode::PageDown => {
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = view_visible_height(size.height);
+                                        let current = usize::from(app.view_scroll);
+                                        set_view_scroll(
+                                            &mut app,
+                                            current.saturating_add(view_h),
+                                            view_h,
+                                        );
+                                    }
+                                }
+                                KeyCode::Home | KeyCode::Char('g') if !app.is_input_active() => {
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = view_visible_height(size.height);
+                                        set_view_scroll(&mut app, 0, view_h);
+                                    } else {
+                                        app.view_scroll = 0;
+                                    }
+                                }
+                                KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = view_visible_height(size.height);
+                                        set_view_scroll(&mut app, usize::MAX, view_h);
+                                    }
+                                }
+                                KeyCode::Char('/') => {
+                                    app.search_input = true;
+                                    app.search_query.clear();
+                                }
+                                KeyCode::Char('t') if !app.is_input_active() => {
+                                    app.view_show_tools = !app.view_show_tools;
+                                    if let Some(id) =
+                                        app.rows.get(app.selected).map(|r| r.id.clone())
+                                    {
+                                        if !app.messages_cache.contains_key(&id) {
+                                            if let Ok((_, msgs)) =
+                                                app.reader.get_messages_by_id(&id)
+                                            {
+                                                app.messages_cache.insert(id.clone(), msgs);
+                                            }
+                                        }
+                                        if let Some(msgs) = app.messages_cache.get(&id) {
+                                            let (lines, text) =
+                                                render_message_lines(msgs, app.view_show_tools);
+                                            app.view_lines = lines;
+                                            app.view_text = text;
+                                            if !app.search_query.is_empty() {
+                                                let needle = app.search_query.to_lowercase();
+                                                let matches: Vec<usize> = app
+                                                    .view_text
+                                                    .iter()
+                                                    .enumerate()
+                                                    .filter_map(|(i, line)| {
+                                                        if line.to_lowercase().contains(&needle) {
+                                                            Some(i)
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .collect();
+                                                if matches.is_empty() {
+                                                    app.search_matches.clear();
+                                                    app.search_index = 0;
+                                                } else {
+                                                    app.search_matches = matches;
+                                                    app.search_index = app
+                                                        .search_index
+                                                        .min(app.search_matches.len() - 1);
+                                                }
+                                            }
+                                            if let Ok(size) = terminal.size() {
+                                                let view_h = view_visible_height(size.height);
+                                                let current = usize::from(app.view_scroll);
+                                                set_view_scroll(&mut app, current, view_h);
+                                            } else if app.view_lines.is_empty() {
+                                                app.view_scroll = 0;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            KeyCode::Enter if app.search_input => {
-                                // compute matches
-                                app.search_matches.clear();
-                                app.search_index = 0;
-                                if !app.search_query.is_empty() {
-                                    let needle = app.search_query.to_lowercase();
-                                    for (i, line) in app.view_text.iter().enumerate() {
-                                        if line.to_lowercase().contains(&needle) {
-                                            app.search_matches.push(i);
+                                KeyCode::Enter if app.search_input => {
+                                    // compute matches
+                                    app.search_matches.clear();
+                                    app.search_index = 0;
+                                    if !app.search_query.is_empty() {
+                                        let needle = app.search_query.to_lowercase();
+                                        for (i, line) in app.view_text.iter().enumerate() {
+                                            if line.to_lowercase().contains(&needle) {
+                                                app.search_matches.push(i);
+                                            }
+                                        }
+                                        if let Some(&line_idx) = app.search_matches.first() {
+                                            if let Ok(size) = terminal.size() {
+                                                let view_h = view_visible_height(size.height);
+                                                set_view_scroll(&mut app, line_idx, view_h);
+                                            } else {
+                                                app.view_scroll =
+                                                    line_idx.min(u16::MAX as usize) as u16;
+                                            }
                                         }
                                     }
-                                    if let Some(&line_idx) = app.search_matches.first() {
-                                        if let Ok(size) = terminal.size() {
-                                            let view_h = view_visible_height(size.height);
-                                            set_view_scroll(&mut app, line_idx, view_h);
-                                        } else {
-                                            app.view_scroll =
-                                                line_idx.min(u16::MAX as usize) as u16;
+                                    app.search_input = false;
+                                }
+                                KeyCode::Char('n')
+                                    if !app.is_input_active() && !app.search_matches.is_empty() =>
+                                {
+                                    app.search_index =
+                                        (app.search_index + 1) % app.search_matches.len();
+                                    let line_idx = app.search_matches[app.search_index];
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = view_visible_height(size.height);
+                                        set_view_scroll(&mut app, line_idx, view_h);
+                                    } else {
+                                        app.view_scroll = line_idx.min(u16::MAX as usize) as u16;
+                                    }
+                                }
+                                KeyCode::Char('N')
+                                    if !app.is_input_active() && !app.search_matches.is_empty() =>
+                                {
+                                    if app.search_index == 0 {
+                                        app.search_index = app.search_matches.len() - 1;
+                                    } else {
+                                        app.search_index -= 1;
+                                    }
+                                    let line_idx = app.search_matches[app.search_index];
+                                    if let Ok(size) = terminal.size() {
+                                        let view_h = view_visible_height(size.height);
+                                        set_view_scroll(&mut app, line_idx, view_h);
+                                    } else {
+                                        app.view_scroll = line_idx.min(u16::MAX as usize) as u16;
+                                    }
+                                }
+                                KeyCode::Char(c) if app.search_input => {
+                                    app.search_query.push(c);
+                                }
+                                KeyCode::Backspace if app.search_input => {
+                                    app.search_query.pop();
+                                }
+                                KeyCode::Char('e') if !app.is_input_active() => {
+                                    if let Some(row) = app.rows.get(app.selected) {
+                                        if let Some(msgs) = app.messages_cache.get(&row.id) {
+                                            let title = &row.id;
+                                            if let Ok(path) = export_html(title, &row.path, msgs) {
+                                                let _ = open::that(path);
+                                            }
                                         }
                                     }
                                 }
-                                app.search_input = false;
-                            }
-                            KeyCode::Char('n')
-                                if !app.is_input_active() && !app.search_matches.is_empty() =>
-                            {
-                                app.search_index =
-                                    (app.search_index + 1) % app.search_matches.len();
-                                let line_idx = app.search_matches[app.search_index];
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = view_visible_height(size.height);
-                                    set_view_scroll(&mut app, line_idx, view_h);
-                                } else {
-                                    app.view_scroll = line_idx.min(u16::MAX as usize) as u16;
+                                KeyCode::Char('i') if !app.is_input_active() => {
+                                    app.show_info_modal = true;
                                 }
-                            }
-                            KeyCode::Char('N')
-                                if !app.is_input_active() && !app.search_matches.is_empty() =>
-                            {
-                                if app.search_index == 0 {
-                                    app.search_index = app.search_matches.len() - 1;
-                                } else {
-                                    app.search_index -= 1;
-                                }
-                                let line_idx = app.search_matches[app.search_index];
-                                if let Ok(size) = terminal.size() {
-                                    let view_h = view_visible_height(size.height);
-                                    set_view_scroll(&mut app, line_idx, view_h);
-                                } else {
-                                    app.view_scroll = line_idx.min(u16::MAX as usize) as u16;
-                                }
-                            }
-                            KeyCode::Char(c) if app.search_input => {
-                                app.search_query.push(c);
-                            }
-                            KeyCode::Backspace if app.search_input => {
-                                app.search_query.pop();
-                            }
-                            KeyCode::Char('e') if !app.is_input_active() => {
-                                if let Some(row) = app.rows.get(app.selected) {
-                                    if let Some(msgs) = app.messages_cache.get(&row.id) {
-                                        let title = &row.id;
-                                        if let Ok(path) = export_html(title, &row.path, msgs) {
-                                            let _ = open::that(path);
-                                        }
+                                KeyCode::Char('r') if !app.is_input_active() => {
+                                    if let Some(row) = app.rows.get(app.selected) {
+                                        app.resume_session_request =
+                                            Some((row.id.clone(), row.path.clone()));
                                     }
                                 }
+                                _ => {}
                             }
-                            KeyCode::Char('i') if !app.is_input_active() => {
-                                app.show_info_modal = true;
-                            }
-                            KeyCode::Char('r') if !app.is_input_active() => {
-                                if let Some(row) = app.rows.get(app.selected) {
-                                    app.resume_session_request =
-                                        Some((row.id.clone(), row.path.clone()));
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                }
+                _ => {}
             }
-        }
-        if last_tick.elapsed() >= tick_rate {
-            last_tick = Instant::now();
         }
     }
 
