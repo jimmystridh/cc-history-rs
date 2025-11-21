@@ -1859,74 +1859,6 @@ fn set_view_scroll(app: &mut App, value: usize, view_height: usize) {
     app.view_scroll = capped as u16;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{first_nonempty_text, format_path_cell, tool_preview_summary, Message};
-
-    #[test]
-    fn keeps_home_prefix_for_short_paths() {
-        assert_eq!(format_path_cell("~/code", 10), "~/code");
-    }
-
-    #[test]
-    fn truncates_home_path_with_ellipsis() {
-        assert_eq!(format_path_cell("~/projects/deep/path", 12), "~/p/de…/path");
-    }
-
-    #[test]
-    fn narrows_home_path_without_root_when_needed() {
-        assert_eq!(format_path_cell("~/projects/deep/path", 6), "~/…/…h");
-    }
-
-    #[test]
-    fn falls_back_to_suffix_when_space_tight() {
-        assert_eq!(format_path_cell("~/projects/deep/path", 3), "…th");
-    }
-
-    #[test]
-    fn truncates_absolute_paths() {
-        assert_eq!(format_path_cell("/Users/name/project", 12), "/U/n/project");
-    }
-
-    #[test]
-    fn truncates_windows_paths() {
-        assert_eq!(
-            format_path_cell("C:/Users/name/project", 12),
-            "C:/…/project"
-        );
-    }
-
-    #[test]
-    fn preview_prefers_last_assistant_when_available() {
-        let msgs = vec![
-            Message {
-                role: "user".into(),
-                content: "Warmup".into(),
-            },
-            Message {
-                role: "assistant".into(),
-                content: "Final assistant summary".into(),
-            },
-        ];
-        let preview = first_nonempty_text(&msgs).expect("preview");
-        assert_eq!(preview, "Final assistant summary");
-    }
-
-    #[test]
-    fn tool_preview_skips_header_and_uses_stdout_line() {
-        let content = "◀ Tool Result\n\nStdout:\n\n```\nfirst line\nsecond line\n```\n";
-        assert_eq!(tool_preview_summary(content), "Stdout: first line");
-    }
-
-    #[test]
-    fn tool_preview_uses_first_meaningful_line() {
-        let content = "◀ Tool Result\nOperation completed successfully\nMore details";
-        assert_eq!(
-            tool_preview_summary(content),
-            "Operation completed successfully"
-        );
-    }
-}
 
 fn render_message_lines(
     msgs: &[Message],
@@ -3722,4 +3654,73 @@ fn write_config_json(v: &serde_json::Value) -> Result<()> {
         fs::write(file, serde_json::to_string_pretty(v)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_nonempty_text, format_path_cell, tool_preview_summary, Message};
+
+    #[test]
+    fn keeps_home_prefix_for_short_paths() {
+        assert_eq!(format_path_cell("~/code", 10), "~/code");
+    }
+
+    #[test]
+    fn truncates_home_path_with_ellipsis() {
+        assert_eq!(format_path_cell("~/projects/deep/path", 12), "~/p/de…/path");
+    }
+
+    #[test]
+    fn narrows_home_path_without_root_when_needed() {
+        assert_eq!(format_path_cell("~/projects/deep/path", 6), "~/…/…h");
+    }
+
+    #[test]
+    fn falls_back_to_suffix_when_space_tight() {
+        assert_eq!(format_path_cell("~/projects/deep/path", 3), "…th");
+    }
+
+    #[test]
+    fn truncates_absolute_paths() {
+        assert_eq!(format_path_cell("/Users/name/project", 12), "/U/n/project");
+    }
+
+    #[test]
+    fn truncates_windows_paths() {
+        assert_eq!(
+            format_path_cell("C:/Users/name/project", 12),
+            "C:/…/project"
+        );
+    }
+
+    #[test]
+    fn preview_prefers_last_assistant_when_available() {
+        let msgs = vec![
+            Message {
+                role: "user".into(),
+                content: "Warmup".into(),
+            },
+            Message {
+                role: "assistant".into(),
+                content: "Final assistant summary".into(),
+            },
+        ];
+        let preview = first_nonempty_text(&msgs).expect("preview");
+        assert_eq!(preview, "Final assistant summary");
+    }
+
+    #[test]
+    fn tool_preview_skips_header_and_uses_stdout_line() {
+        let content = "◀ Tool Result\n\nStdout:\n\n```\nfirst line\nsecond line\n```\n";
+        assert_eq!(tool_preview_summary(content), "Stdout: first line");
+    }
+
+    #[test]
+    fn tool_preview_uses_first_meaningful_line() {
+        let content = "◀ Tool Result\nOperation completed successfully\nMore details";
+        assert_eq!(
+            tool_preview_summary(content),
+            "Operation completed successfully"
+        );
+    }
 }
