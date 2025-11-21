@@ -21,7 +21,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -104,11 +104,15 @@ struct App {
     list_search_query: String,
     list_search_in_progress: bool,
     list_search_rx: Option<Receiver<Vec<RowItem>>>,
+    // rename session
+    rename_input: bool,
+    rename_query: String,
     // fs watching + refreshing
     updating_in_progress: bool,
     update_rx: Option<Receiver<Vec<RowItem>>>,
-    fs_ping_rx: Option<Receiver<()>>,
+    fs_ping_rx: Option<Receiver<Vec<PathBuf>>>,
     watcher_enabled: bool,
+    last_renamed: Option<(PathBuf, Instant)>,
     // info modal
     show_info_modal: bool,
     // help modal
@@ -176,6 +180,8 @@ impl App {
                 list_search_query: String::new(),
                 list_search_in_progress: false,
                 list_search_rx: None,
+                rename_input: false,
+                rename_query: String::new(),
                 updating_in_progress: false,
                 update_rx: None,
                 fs_ping_rx: if watch_pref {
@@ -184,6 +190,7 @@ impl App {
                     None
                 },
                 watcher_enabled: watch_pref,
+                last_renamed: None,
                 show_info_modal: false,
                 show_help_modal: false,
                 show_settings_modal: false,
@@ -263,10 +270,13 @@ impl App {
             list_search_query: String::new(),
             list_search_in_progress: false,
             list_search_rx: None,
+            rename_input: false,
+            rename_query: String::new(),
             updating_in_progress: false,
             update_rx: None,
             fs_ping_rx: ping_rx,
             watcher_enabled: watch_pref,
+            last_renamed: None,
             show_info_modal: false,
             show_help_modal: false,
             show_settings_modal: false,
@@ -308,7 +318,7 @@ impl App {
     }
 
     fn is_input_active(&self) -> bool {
-        self.list_search_input || self.search_input || self.show_settings_modal
+        self.list_search_input || self.search_input || self.show_settings_modal || self.rename_input
     }
 
     fn clear_pending_list_position(&mut self) {
@@ -925,8 +935,10 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     let footer_text = if app.list_search_input {
         format!("/{}  — Enter run  Esc cancel", app.list_search_query)
+    } else if app.rename_input {
+        format!("Rename: {}_  — Enter save  Esc cancel", app.rename_query)
     } else {
-        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   a archive   u undo   f filter cwd   / search   s sort key   o order   e export   i info   , settings   r resume   x clear   q quit ".to_string()
+        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   a archive   u undo   f filter cwd   / search   s sort key   o order   e export   n rename   i info   , settings   r resume   x clear   q quit ".to_string()
     };
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
@@ -1264,6 +1276,71 @@ fn duplicate_selected_session(app: &mut App) -> Result<()> {
     }
 
     spawn_full_refresh(app);
+
+    Ok(())
+}
+
+fn rename_selected_session(app: &mut App) -> Result<()> {
+    let selected_row = app
+        .rows
+        .get(app.selected)
+        .cloned()
+        .ok_or_else(|| anyhow!("No session selected"))?;
+
+    let original_path = PathBuf::from(&selected_row.file_path);
+    if !original_path.exists() {
+        return Err(anyhow!(
+            "Session file not found at {}",
+            original_path.display()
+        ));
+    }
+
+    let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_uuid = generate_uuid()?;
+    let temp_path = parent.join(format!(".rename-{}.tmp", temp_uuid));
+
+    {
+        let source = fs::File::open(&original_path)?;
+        let reader = io::BufReader::new(source);
+        let mut dest = fs::File::create(&temp_path)?;
+
+        let summary_json = serde_json::json!({
+            "type": "summary",
+            "summary": app.rename_query
+        });
+        use std::io::Write;
+        writeln!(dest, "{}", summary_json)?;
+
+        use std::io::BufRead;
+        for line in reader.lines() {
+            let line = line?;
+            // Filter out existing summary lines to avoid duplication
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if v.get("type").and_then(|x| x.as_str()) == Some("summary") {
+                    continue;
+                }
+            }
+            writeln!(dest, "{}", line)?;
+        }
+    }
+
+    fs::rename(&temp_path, &original_path)?;
+
+    app.last_renamed = Some((original_path.clone(), Instant::now()));
+
+    let preview = single_line_preview(&app.rename_query, 240);
+
+    // Update memory
+    if let Some(row) = app.all_rows.iter_mut().find(|r| r.id == selected_row.id) {
+        row.first_msg = preview.clone();
+    }
+    if let Some(row) = app.rows.iter_mut().find(|r| r.id == selected_row.id) {
+        row.first_msg = preview;
+    }
+
+    // We don't need a full refresh because we updated in-place.
+    // The filesystem watcher might trigger one eventually, but we don't need to force it now.
+    // spawn_full_refresh(app);
 
     Ok(())
 }
@@ -2156,6 +2233,7 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line("r", "Resume session in shell"));
     lines.push(shortcut_line("a", "Archive selected session"));
     lines.push(shortcut_line("d", "Duplicate selected session"));
+    lines.push(shortcut_line("n", "Rename selected session"));
     lines.push(shortcut_line("u", "Undo last archive"));
     lines.push(shortcut_line("e", "Export session to HTML"));
 
@@ -2532,9 +2610,24 @@ fn main() -> Result<()> {
         }
         // React to FS ping
         if let Some(prx) = &app.fs_ping_rx {
-            if prx.try_recv().is_ok() && !app.updating_in_progress {
-                spawn_full_refresh(&mut app);
-                needs_redraw = true;
+            if let Ok(paths) = prx.try_recv() {
+                if !app.updating_in_progress {
+                    let mut ignore = false;
+                    if let Some((renamed_path, time)) = &app.last_renamed {
+                        if time.elapsed() < Duration::from_secs(2) {
+                            if paths.iter().any(|p| p == renamed_path) {
+                                ignore = true;
+                            }
+                        } else {
+                            app.last_renamed = None;
+                        }
+                    }
+
+                    if !ignore {
+                        spawn_full_refresh(&mut app);
+                        needs_redraw = true;
+                    }
+                }
             }
         }
 
@@ -2700,6 +2793,16 @@ fn main() -> Result<()> {
                                             eprintln!("Failed to duplicate session: {}", err);
                                         }
                                     }
+                                    KeyCode::Char('n') if !app.is_input_active() => {
+                                        if let Some(row) = app.rows.get(app.selected) {
+                                            app.rename_input = true;
+                                            // Start with the current summary/first msg as the default value
+                                            // We use the row's first_msg which is already a preview,
+                                            // but it's better than nothing. Ideally we would read the full summary
+                                            // from file, but that might be slow.
+                                            app.rename_query = row.first_msg.clone();
+                                        }
+                                    }
                                     KeyCode::Char('u') if !app.is_input_active() => {
                                         if let Err(err) = undo_last_archive(&mut app) {
                                             eprintln!("Failed to undo archive: {}", err);
@@ -2718,6 +2821,22 @@ fn main() -> Result<()> {
                                     }
                                     KeyCode::Char(c) if app.list_search_input => {
                                         app.list_search_query.push(c);
+                                    }
+                                    // Rename input handling
+                                    KeyCode::Esc if app.rename_input => {
+                                        app.rename_input = false;
+                                    }
+                                    KeyCode::Enter if app.rename_input => {
+                                        if let Err(e) = rename_selected_session(&mut app) {
+                                            eprintln!("Rename failed: {}", e);
+                                        }
+                                        app.rename_input = false;
+                                    }
+                                    KeyCode::Backspace if app.rename_input => {
+                                        app.rename_query.pop();
+                                    }
+                                    KeyCode::Char(c) if app.rename_input => {
+                                        app.rename_query.push(c);
                                     }
                                     // Settings modal input handling
                                     KeyCode::Enter if app.show_settings_modal => {
@@ -3331,32 +3450,34 @@ fn spawn_full_refresh(app: &mut App) {
     let (tx, rx) = mpsc::channel();
     app.update_rx = Some(rx);
     app.updating_in_progress = true;
-    let reader = chat_reader::ChatReader::new();
-    let mut rows: Vec<RowItem> = Vec::new();
-    if let Ok(convos) = reader.list_conversations() {
-        rows = convos
-            .into_iter()
-            .map(|c| {
-                let summary_preview = c
-                    .summary
-                    .as_ref()
-                    .map(|s| single_line_preview(s, 240))
-                    .unwrap_or_default();
-                RowItem {
-                    id: c.id,
-                    date_ms: c.created_at.unwrap_or(0),
-                    path: c.path.unwrap_or_default(),
-                    first_msg: summary_preview,
-                    file_path: c.file.display().to_string(),
-                    last_msg_ms: None,
-                }
-            })
-            .collect();
-    }
-    // Apply current sort key/order
+    let projects_dir = app.projects_dir.clone();
     let key = app.sort_key;
     let desc = app.sort_desc;
+
     thread::spawn(move || {
+        let reader = chat_reader::ChatReader::with_projects_dir(projects_dir);
+        let mut rows: Vec<RowItem> = Vec::new();
+        if let Ok(convos) = reader.list_conversations() {
+            rows = convos
+                .into_iter()
+                .map(|c| {
+                    let summary_preview = c
+                        .summary
+                        .as_ref()
+                        .map(|s| single_line_preview(s, 240))
+                        .unwrap_or_default();
+                    RowItem {
+                        id: c.id,
+                        date_ms: c.created_at.unwrap_or(0),
+                        path: c.path.unwrap_or_default(),
+                        first_msg: summary_preview,
+                        file_path: c.file.display().to_string(),
+                        last_msg_ms: None,
+                    }
+                })
+                .collect();
+        }
+
         match key {
             SortKey::Created => {
                 if desc {
@@ -3445,8 +3566,8 @@ fn spawn_fs_watcher(app: &mut App) {
             if let Some(w) = watcher.as_mut() {
                 let _ = w.watch(&projects, RecursiveMode::Recursive);
                 while let Ok(evt) = rxn.recv() {
-                    if evt.is_ok() {
-                        let _ = ping_tx.send(());
+                    if let Ok(event) = evt {
+                        let _ = ping_tx.send(event.paths);
                     }
                 }
             }
@@ -3455,7 +3576,7 @@ fn spawn_fs_watcher(app: &mut App) {
 }
 
 // Spawn watcher at startup and return its ping receiver
-fn spawn_initial_fs_watcher(projects: &Path) -> Option<Receiver<()>> {
+fn spawn_initial_fs_watcher(projects: &Path) -> Option<Receiver<Vec<PathBuf>>> {
     if projects.exists() {
         let projects = projects.to_path_buf();
         let (ping_tx, ping_rx) = mpsc::channel();
@@ -3469,8 +3590,8 @@ fn spawn_initial_fs_watcher(projects: &Path) -> Option<Receiver<()>> {
             if let Some(w) = watcher.as_mut() {
                 let _ = w.watch(&projects, RecursiveMode::Recursive);
                 while let Ok(evt) = rxn.recv() {
-                    if evt.is_ok() {
-                        let _ = ping_tx.send(());
+                    if let Ok(event) = evt {
+                        let _ = ping_tx.send(event.paths);
                     }
                 }
             }

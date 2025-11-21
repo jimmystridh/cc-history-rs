@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::Value;
 use similar::TextDiff;
@@ -7,6 +8,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+static HOME_DIR: Lazy<Option<PathBuf>> = Lazy::new(dirs::home_dir);
 
 #[derive(Debug, Clone)]
 pub struct ConversationMeta {
@@ -177,7 +180,7 @@ fn extract_metadata_fields(val: &Value) -> (Option<String>, Option<i64>) {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    dirs::home_dir()
+    HOME_DIR.clone()
 }
 
 pub fn short_path(p: &str) -> String {
