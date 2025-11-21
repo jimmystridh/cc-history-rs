@@ -674,7 +674,7 @@ fn language_candidates(token: &str) -> Vec<String> {
         candidates.push(trimmed.replace('#', "sharp"));
     }
     if trimmed.contains('.') {
-        candidates.push(trimmed.split('.').last().unwrap_or(trimmed).to_string());
+    candidates.push(trimmed.split('.').next_back().unwrap_or(trimmed).to_string());
     }
 
     candidates
@@ -1197,6 +1197,77 @@ fn archive_selected_session(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+fn generate_uuid() -> Result<String> {
+    let output = std::process::Command::new("uuidgen")
+        .output()?;
+    let s = String::from_utf8(output.stdout)?;
+    Ok(s.trim().to_lowercase())
+}
+
+fn duplicate_selected_session(app: &mut App) -> Result<()> {
+    let selected_row = app
+        .rows
+        .get(app.selected)
+        .cloned()
+        .ok_or_else(|| anyhow!("No session selected"))?;
+
+    let original_path = PathBuf::from(&selected_row.file_path);
+    if !original_path.exists() {
+        return Err(anyhow!(
+            "Session file not found at {}",
+            original_path.display()
+        ));
+    }
+
+    let new_id = generate_uuid()?;
+    let extension = original_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("jsonl");
+    let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
+    let new_path = parent.join(format!("{}.{}", new_id, extension));
+
+    if new_path.exists() {
+        return Err(anyhow!("Generated UUID collision, try again"));
+    }
+
+    {
+        let mut source = fs::File::open(&original_path)?;
+        let mut dest = fs::File::create(&new_path)?;
+
+        // Prepend a new summary so the list view shows it's a copy
+        let new_summary = if selected_row.first_msg.is_empty() {
+            format!("(Copy) {}", selected_row.id)
+        } else {
+            format!("(Copy) {}", selected_row.first_msg)
+        };
+
+        let summary_json = serde_json::json!({
+            "type": "summary",
+            "summary": new_summary
+        });
+        use std::io::Write;
+        writeln!(dest, "{}", summary_json)?;
+
+        // Copy original content
+        std::io::copy(&mut source, &mut dest)?;
+
+        // Append duplication message for the chat view
+        let dup_msg = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": format!("Session duplicated from {}", selected_row.id)
+            }
+        });
+        writeln!(dest, "{}", dup_msg)?;
+    }
+
+    spawn_full_refresh(app);
+
+    Ok(())
+}
+
 fn undo_last_archive(app: &mut App) -> Result<()> {
     let action = match app.last_archived.clone() {
         Some(action) => action,
@@ -1274,14 +1345,10 @@ fn archive_root_dir(projects_dir: &Path) -> PathBuf {
 }
 
 fn remove_row_by_id(rows: &mut Vec<RowItem>, id: &str) -> Option<RowItem> {
-    if let Some(idx) = rows.iter().position(|r| r.id == id) {
-        Some(rows.remove(idx))
-    } else {
-        None
-    }
+    rows.iter().position(|r| r.id == id).map(|idx| rows.remove(idx))
 }
 
-fn sort_rows_by(rows: &mut Vec<RowItem>, key: SortKey, desc: bool) {
+fn sort_rows_by(rows: &mut [RowItem], key: SortKey, desc: bool) {
     match key {
         SortKey::Created => {
             if desc {
@@ -1334,7 +1401,7 @@ fn adjust_selection_after_change(app: &mut App) {
     }
 }
 
-fn highlight_current_line(lines: &Vec<Line<'static>>, idx: usize) -> Vec<Line<'static>> {
+fn highlight_current_line(lines: &[Line<'static>], idx: usize) -> Vec<Line<'static>> {
     let mut out = Vec::with_capacity(lines.len());
     for (i, ln) in lines.iter().cloned().enumerate() {
         if i == idx {
@@ -1454,16 +1521,16 @@ fn format_path_cell(path: &str, width: usize) -> String {
 
     let mut remainder: &str = &normalized;
     let mut root: Option<String> = None;
-    if normalized.starts_with("~/") {
+    if let Some(rest) = normalized.strip_prefix("~/") {
         root = Some("~".to_string());
-        remainder = &normalized[2..];
+        remainder = rest;
     } else if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
         let drive = &normalized[..2];
         root = Some(drive.to_string());
         remainder = normalized[2..].trim_start_matches('/');
-    } else if normalized.starts_with('/') {
+    } else if let Some(rest) = normalized.strip_prefix('/') {
         root = Some("/".to_string());
-        remainder = &normalized[1..];
+        remainder = rest;
     }
 
     let mut components: Vec<&str> = if remainder.is_empty() {
@@ -1525,9 +1592,10 @@ fn format_path_cell(path: &str, width: usize) -> String {
 
         if !collapsed_prefix && !segments.is_empty() {
             if segments.len() > 1 {
-                let mut new_segments = Vec::new();
-                new_segments.push(segments[0].clone());
-                new_segments.push(PathSegment::literal("…/"));
+                let new_segments = vec![
+                    segments[0].clone(),
+                    PathSegment::literal("…/"),
+                ];
                 segments = new_segments;
             } else {
                 segments = vec![PathSegment::literal("…/")];
@@ -1636,9 +1704,8 @@ fn build_component_variants(component: &str) -> Vec<String> {
         return vec!["/".to_string()];
     }
 
-    let mut variants: Vec<String> = Vec::new();
     let full = format!("{}/", component);
-    variants.push(full.clone());
+    let mut variants = vec![full.clone()];
 
     let chars: Vec<char> = component.chars().collect();
     let len = chars.len();
@@ -2088,6 +2155,7 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line("w", "Toggle filesystem watcher"));
     lines.push(shortcut_line("r", "Resume session in shell"));
     lines.push(shortcut_line("a", "Archive selected session"));
+    lines.push(shortcut_line("d", "Duplicate selected session"));
     lines.push(shortcut_line("u", "Undo last archive"));
     lines.push(shortcut_line("e", "Export session to HTML"));
 
@@ -2625,6 +2693,11 @@ fn main() -> Result<()> {
                                     KeyCode::Char('a') if !app.is_input_active() => {
                                         if let Err(err) = archive_selected_session(&mut app) {
                                             eprintln!("Failed to archive session: {}", err);
+                                        }
+                                    }
+                                    KeyCode::Char('d') if !app.is_input_active() => {
+                                        if let Err(err) = duplicate_selected_session(&mut app) {
+                                            eprintln!("Failed to duplicate session: {}", err);
                                         }
                                     }
                                     KeyCode::Char('u') if !app.is_input_active() => {

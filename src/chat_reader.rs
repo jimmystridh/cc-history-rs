@@ -244,7 +244,7 @@ impl ChatReader {
                     let mut cwd = None;
                     let mut created_at = None;
 
-                    for line_str in reader.lines().flatten() {
+                    for line_str in reader.lines().map_while(Result::ok) {
                         if let Ok(v) = serde_json::from_str::<Value>(&line_str) {
                             if summary.is_none()
                                 && v.get("type").and_then(|x| x.as_str()) == Some("summary")
