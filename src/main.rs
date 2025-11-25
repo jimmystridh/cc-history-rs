@@ -2343,9 +2343,97 @@ fn resume_claude_session(claude_command: &str, session_id: &str, session_path: &
     }
 }
 
+fn print_shell_init(shell: &str) {
+    let binary_name = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "cc-history".to_string());
+
+    match shell {
+        "zsh" | "bash" => {
+            // Use a function that wraps the real binary
+            // The binary writes to a temp file when it wants to change directory
+            println!(
+                r#"# cc-history shell integration
+# Add this to your ~/.{shell}rc:
+#   eval "$(cc-history init {shell})"
+
+cc-history() {{
+    local cd_file="/tmp/cc-history-cd.$$"
+    local exit_code
+
+    # Run the real binary with the CD file path
+    __CC_HISTORY_CD_FILE__="$cd_file" command {binary} "$@"
+    exit_code=$?
+
+    # Check if the binary wrote a directory to cd to
+    if [[ -f "$cd_file" ]]; then
+        local cd_path="$(cat "$cd_file")"
+        rm -f "$cd_file"
+        if [[ -n "$cd_path" && -d "$cd_path" ]]; then
+            cd "$cd_path"
+        fi
+    fi
+
+    return $exit_code
+}}"#,
+                shell = shell,
+                binary = binary_name,
+            );
+        }
+        "fish" => {
+            println!(
+                r#"# cc-history shell integration for fish
+# Add this to your ~/.config/fish/config.fish:
+#   cc-history init fish | source
+
+function cc-history
+    set -l cd_file "/tmp/cc-history-cd.$fish_pid"
+    set -lx __CC_HISTORY_CD_FILE__ "$cd_file"
+
+    command {binary} $argv
+    set -l exit_code $status
+
+    # Check if the binary wrote a directory to cd to
+    if test -f "$cd_file"
+        set -l cd_path (cat "$cd_file")
+        rm -f "$cd_file"
+        if test -n "$cd_path" -a -d "$cd_path"
+            cd $cd_path
+        end
+    end
+
+    return $exit_code
+end"#,
+                binary = binary_name,
+            );
+        }
+        _ => {
+            eprintln!(
+                "Unsupported shell: {}. Supported shells: zsh, bash, fish",
+                shell
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Optional override for projects directory
     let args: Vec<String> = std::env::args().collect();
+
+    // Handle init subcommand for shell integration
+    if let Some(idx) = args.iter().position(|a| a == "init") {
+        if let Some(shell) = args.get(idx + 1) {
+            print_shell_init(shell);
+            return Ok(());
+        } else {
+            eprintln!("Usage: cc-history init <shell>");
+            eprintln!("Supported shells: zsh, bash, fish");
+            std::process::exit(1);
+        }
+    }
+
     let mut projects_override: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
@@ -2581,6 +2669,14 @@ fn main() -> Result<()> {
             match result {
                 Ok(_) => {
                     if app.settings_quit_after_launch {
+                        // Write CD path to temp file for shell integration to pick up
+                        // This allows the parent shell to cd to the session's directory
+                        if !session_path.is_empty() && std::path::Path::new(&session_path).exists()
+                        {
+                            if let Ok(cd_file) = std::env::var("__CC_HISTORY_CD_FILE__") {
+                                let _ = std::fs::write(&cd_file, &session_path);
+                            }
+                        }
                         // Command executed successfully, exit the app
                         return Ok(());
                     } else {
