@@ -107,6 +107,9 @@ struct App {
     // rename session
     rename_input: bool,
     rename_query: String,
+    // repath session (change base directory)
+    repath_input: bool,
+    repath_query: String,
     // fs watching + refreshing
     updating_in_progress: bool,
     update_rx: Option<Receiver<Vec<RowItem>>>,
@@ -182,6 +185,8 @@ impl App {
                 list_search_rx: None,
                 rename_input: false,
                 rename_query: String::new(),
+                repath_input: false,
+                repath_query: String::new(),
                 updating_in_progress: false,
                 update_rx: None,
                 fs_ping_rx: if watch_pref {
@@ -272,6 +277,8 @@ impl App {
             list_search_rx: None,
             rename_input: false,
             rename_query: String::new(),
+            repath_input: false,
+            repath_query: String::new(),
             updating_in_progress: false,
             update_rx: None,
             fs_ping_rx: ping_rx,
@@ -318,7 +325,7 @@ impl App {
     }
 
     fn is_input_active(&self) -> bool {
-        self.list_search_input || self.search_input || self.show_settings_modal || self.rename_input
+        self.list_search_input || self.search_input || self.show_settings_modal || self.rename_input || self.repath_input
     }
 
     fn clear_pending_list_position(&mut self) {
@@ -937,8 +944,10 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
         format!("/{}  — Enter run  Esc cancel", app.list_search_query)
     } else if app.rename_input {
         format!("Rename: {}_  — Enter save  Esc cancel", app.rename_query)
+    } else if app.repath_input {
+        format!("Path: {}_  — Enter save  Esc cancel", app.repath_query)
     } else {
-        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   a archive   u undo   f filter cwd   / search   s sort key   o order   e export   n rename   i info   , settings   r resume   x clear   q quit ".to_string()
+        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   a archive   u undo   f filter cwd   / search   s sort key   o order   e export   n rename   p repath   i info   , settings   r resume   x clear   q quit ".to_string()
     };
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
@@ -976,6 +985,8 @@ fn render_view(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     let footer_text = if app.search_input {
         format!("/{}", app.search_query)
+    } else if app.repath_input {
+        format!("Path: {}_  — Enter save  Esc cancel", app.repath_query)
     } else if !app.search_query.is_empty() {
         if app.search_matches.is_empty() {
             String::from(" 0/0 — / to search — t toggle tools — T expand/collapse — a archive ")
@@ -988,7 +999,7 @@ fn render_view(f: &mut ratatui::Frame, area: Rect, app: &App) {
         }
     } else {
         String::from(
-            " ↑/↓ scroll   PgUp/PgDn page   Home/g top   End/G bottom   / search   t toggle tools   T expand/collapse   Esc/q back   i info   r resume   e export   a archive   u undo ",
+            " ↑/↓ scroll   PgUp/PgDn page   Home/g top   End/G bottom   / search   t toggle tools   T expand/collapse   Esc/q back   i info   r resume   e export   a archive   u undo   p repath ",
         )
     };
     let footer = Paragraph::new(Line::from(Span::styled(
@@ -1341,6 +1352,160 @@ fn rename_selected_session(app: &mut App) -> Result<()> {
     // We don't need a full refresh because we updated in-place.
     // The filesystem watcher might trigger one eventually, but we don't need to force it now.
     // spawn_full_refresh(app);
+
+    Ok(())
+}
+
+/// Encode a filesystem path into Claude's project directory naming scheme.
+/// e.g., "/Users/js/code/project" -> "-Users-js-code-project"
+/// e.g., "/Users/js/code/visma.admin" -> "-Users-js-code-visma-admin"
+/// Claude replaces both '/' and '.' with '-'
+fn encode_path_to_dir_name(path: &str) -> String {
+    path.replace('/', "-").replace('.', "-")
+}
+
+fn repath_selected_session(app: &mut App) -> Result<()> {
+    let selected_row = app
+        .rows
+        .get(app.selected)
+        .cloned()
+        .ok_or_else(|| anyhow!("No session selected"))?;
+
+    let original_file_path = PathBuf::from(&selected_row.file_path);
+    if !original_file_path.exists() {
+        return Err(anyhow!(
+            "Session file not found at {}",
+            original_file_path.display()
+        ));
+    }
+
+    let new_cwd = app.repath_query.trim();
+    if new_cwd.is_empty() {
+        return Err(anyhow!("New path cannot be empty"));
+    }
+
+    // Get the session filename (e.g., "b6de2331-c27d-4935-871c-fea9d24f88d3.jsonl")
+    let file_name = original_file_path
+        .file_name()
+        .ok_or_else(|| anyhow!("Invalid file path"))?;
+
+    // Compute the new directory name based on the new path
+    let new_dir_name = encode_path_to_dir_name(new_cwd);
+    let new_dir = app.projects_dir.join(&new_dir_name);
+
+    // Create the new directory if it doesn't exist
+    fs::create_dir_all(&new_dir)?;
+
+    // Compute the new file path
+    let new_file_path = new_dir.join(file_name);
+
+    // Check if destination already exists (different session with same ID - unlikely but possible)
+    if new_file_path.exists() && new_file_path != original_file_path {
+        return Err(anyhow!(
+            "A session file already exists at {}",
+            new_file_path.display()
+        ));
+    }
+
+    // If the paths are the same, just update metadata
+    if new_file_path == original_file_path {
+        // Only need to update the cwd metadata inside the file
+        let parent = original_file_path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_uuid = generate_uuid()?;
+        let temp_path = parent.join(format!(".repath-{}.tmp", temp_uuid));
+
+        {
+            let source = fs::File::open(&original_file_path)?;
+            let reader = io::BufReader::new(source);
+            let mut dest = fs::File::create(&temp_path)?;
+
+            let metadata_json = serde_json::json!({
+                "type": "metadata",
+                "cwd": new_cwd
+            });
+            use std::io::Write;
+            writeln!(dest, "{}", metadata_json)?;
+
+            use std::io::BufRead;
+            for line in reader.lines() {
+                let line = line?;
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("type").and_then(|x| x.as_str()) == Some("metadata") {
+                        if let Some(obj) = v.as_object() {
+                            let has_only_path_fields = obj.keys().all(|k| {
+                                matches!(k.as_str(), "type" | "cwd" | "workspace" | "path")
+                            });
+                            if has_only_path_fields {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                writeln!(dest, "{}", line)?;
+            }
+        }
+
+        fs::rename(&temp_path, &original_file_path)?;
+    } else {
+        // Need to move the file to a new directory
+        // First, create a temp file in the new directory with updated metadata
+        let temp_uuid = generate_uuid()?;
+        let temp_path = new_dir.join(format!(".repath-{}.tmp", temp_uuid));
+
+        {
+            let source = fs::File::open(&original_file_path)?;
+            let reader = io::BufReader::new(source);
+            let mut dest = fs::File::create(&temp_path)?;
+
+            // Prepend a metadata line with the new cwd
+            let metadata_json = serde_json::json!({
+                "type": "metadata",
+                "cwd": new_cwd
+            });
+            use std::io::Write;
+            writeln!(dest, "{}", metadata_json)?;
+
+            use std::io::BufRead;
+            for line in reader.lines() {
+                let line = line?;
+                // Filter out existing metadata lines that only contain cwd/workspace/path
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("type").and_then(|x| x.as_str()) == Some("metadata") {
+                        if let Some(obj) = v.as_object() {
+                            let has_only_path_fields = obj.keys().all(|k| {
+                                matches!(k.as_str(), "type" | "cwd" | "workspace" | "path")
+                            });
+                            if has_only_path_fields {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                writeln!(dest, "{}", line)?;
+            }
+        }
+
+        // Rename temp file to final destination
+        fs::rename(&temp_path, &new_file_path)?;
+
+        // Remove the original file
+        fs::remove_file(&original_file_path)?;
+    }
+
+    app.last_renamed = Some((new_file_path.clone(), Instant::now()));
+
+    let new_path_str = new_cwd.to_string();
+    let new_file_path_str = new_file_path.to_string_lossy().to_string();
+
+    // Update memory
+    if let Some(row) = app.all_rows.iter_mut().find(|r| r.id == selected_row.id) {
+        row.path = new_path_str.clone();
+        row.file_path = new_file_path_str.clone();
+    }
+    if let Some(row) = app.rows.iter_mut().find(|r| r.id == selected_row.id) {
+        row.path = new_path_str;
+        row.file_path = new_file_path_str;
+    }
 
     Ok(())
 }
@@ -2166,6 +2331,7 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line("a", "Archive selected session"));
     lines.push(shortcut_line("d", "Duplicate selected session"));
     lines.push(shortcut_line("n", "Rename selected session"));
+    lines.push(shortcut_line("p", "Change session base directory"));
     lines.push(shortcut_line("u", "Undo last archive"));
     lines.push(shortcut_line("e", "Export session to HTML"));
 
@@ -2183,6 +2349,7 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line("T", "Expand or collapse tool calls"));
     lines.push(shortcut_line("r", "Resume session in shell"));
     lines.push(shortcut_line("a", "Archive session"));
+    lines.push(shortcut_line("p", "Change session base directory"));
     lines.push(shortcut_line("u", "Undo last archive"));
     lines.push(shortcut_line("e", "Export session to HTML"));
 
@@ -2757,6 +2924,11 @@ fn main() -> Result<()> {
                                     }
                                     KeyCode::Esc if app.show_info_modal => {
                                         app.show_info_modal = false;
+                                        // Re-enable mouse capture when closing info modal
+                                        crossterm::execute!(
+                                            terminal.backend_mut(),
+                                            crossterm::event::EnableMouseCapture
+                                        )?;
                                     }
                                     KeyCode::Esc if app.show_settings_modal => {
                                         // Cancel all changes and close modal
@@ -2768,6 +2940,13 @@ fn main() -> Result<()> {
                                             load_quit_after_launch_pref();
                                     }
                                     KeyCode::Char('?') if !app.is_input_active() => {
+                                        // Re-enable mouse capture if info modal was open
+                                        if app.show_info_modal {
+                                            crossterm::execute!(
+                                                terminal.backend_mut(),
+                                                crossterm::event::EnableMouseCapture
+                                            )?;
+                                        }
                                         app.show_help_modal = true;
                                         app.show_info_modal = false;
                                         app.show_settings_modal = false;
@@ -2796,6 +2975,11 @@ fn main() -> Result<()> {
                                     KeyCode::Char('i') if !app.is_input_active() => {
                                         app.show_info_modal = true;
                                         app.show_help_modal = false;
+                                        // Disable mouse capture so text can be selected
+                                        crossterm::execute!(
+                                            terminal.backend_mut(),
+                                            crossterm::event::DisableMouseCapture
+                                        )?;
                                     }
                                     KeyCode::Char(',') if !app.is_input_active() => {
                                         app.show_help_modal = false;
@@ -2829,6 +3013,13 @@ fn main() -> Result<()> {
                                             // but it's better than nothing. Ideally we would read the full summary
                                             // from file, but that might be slow.
                                             app.rename_query = row.first_msg.clone();
+                                        }
+                                    }
+                                    KeyCode::Char('p') if !app.is_input_active() => {
+                                        if let Some(row) = app.rows.get(app.selected) {
+                                            app.repath_input = true;
+                                            // Start with the current path as the default value
+                                            app.repath_query = row.path.clone();
                                         }
                                     }
                                     KeyCode::Char('u') if !app.is_input_active() => {
@@ -2865,6 +3056,22 @@ fn main() -> Result<()> {
                                     }
                                     KeyCode::Char(c) if app.rename_input => {
                                         app.rename_query.push(c);
+                                    }
+                                    // Repath input handling
+                                    KeyCode::Esc if app.repath_input => {
+                                        app.repath_input = false;
+                                    }
+                                    KeyCode::Enter if app.repath_input => {
+                                        if let Err(e) = repath_selected_session(&mut app) {
+                                            eprintln!("Repath failed: {}", e);
+                                        }
+                                        app.repath_input = false;
+                                    }
+                                    KeyCode::Backspace if app.repath_input => {
+                                        app.repath_query.pop();
+                                    }
+                                    KeyCode::Char(c) if app.repath_input => {
+                                        app.repath_query.push(c);
                                     }
                                     // Settings modal input handling
                                     KeyCode::Enter if app.show_settings_modal => {
@@ -3010,8 +3217,20 @@ fn main() -> Result<()> {
                                 match code {
                                     KeyCode::Esc if app.show_info_modal => {
                                         app.show_info_modal = false;
+                                        // Re-enable mouse capture when closing info modal
+                                        crossterm::execute!(
+                                            terminal.backend_mut(),
+                                            crossterm::event::EnableMouseCapture
+                                        )?;
                                     }
                                     KeyCode::Char('?') if !app.is_input_active() => {
+                                        // Re-enable mouse capture if info modal was open
+                                        if app.show_info_modal {
+                                            crossterm::execute!(
+                                                terminal.backend_mut(),
+                                                crossterm::event::EnableMouseCapture
+                                            )?;
+                                        }
                                         app.show_help_modal = true;
                                         app.show_info_modal = false;
                                         app.show_settings_modal = false;
@@ -3172,6 +3391,22 @@ fn main() -> Result<()> {
                                     KeyCode::Backspace if app.search_input => {
                                         app.search_query.pop();
                                     }
+                                    // Repath input handling in View mode
+                                    KeyCode::Esc if app.repath_input => {
+                                        app.repath_input = false;
+                                    }
+                                    KeyCode::Enter if app.repath_input => {
+                                        if let Err(e) = repath_selected_session(&mut app) {
+                                            eprintln!("Repath failed: {}", e);
+                                        }
+                                        app.repath_input = false;
+                                    }
+                                    KeyCode::Backspace if app.repath_input => {
+                                        app.repath_query.pop();
+                                    }
+                                    KeyCode::Char(c) if app.repath_input => {
+                                        app.repath_query.push(c);
+                                    }
                                     KeyCode::Char('e') if !app.is_input_active() => {
                                         if let Some(row) = app.rows.get(app.selected) {
                                             if let Some(msgs) = app.messages_cache.get(&row.id) {
@@ -3211,11 +3446,22 @@ fn main() -> Result<()> {
                                     KeyCode::Char('i') if !app.is_input_active() => {
                                         app.show_info_modal = true;
                                         app.show_help_modal = false;
+                                        // Disable mouse capture so text can be selected
+                                        crossterm::execute!(
+                                            terminal.backend_mut(),
+                                            crossterm::event::DisableMouseCapture
+                                        )?;
                                     }
                                     KeyCode::Char('r') if !app.is_input_active() => {
                                         if let Some(row) = app.rows.get(app.selected) {
                                             app.resume_session_request =
                                                 Some((row.id.clone(), row.path.clone()));
+                                        }
+                                    }
+                                    KeyCode::Char('p') if !app.is_input_active() => {
+                                        if let Some(row) = app.rows.get(app.selected) {
+                                            app.repath_input = true;
+                                            app.repath_query = row.path.clone();
                                         }
                                     }
                                     _ => {}
