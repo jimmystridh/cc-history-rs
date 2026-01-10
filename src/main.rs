@@ -57,6 +57,17 @@ struct RowItem {
 }
 
 #[derive(Clone)]
+enum DisplayRow {
+    Group {
+        path: String,
+        count: usize,
+        newest_date_ms: i64,
+        newest_preview: String,
+    },
+    Conversation(RowItem),
+}
+
+#[derive(Clone)]
 struct ArchivedAction {
     row: RowItem,
     original_path: PathBuf,
@@ -134,6 +145,10 @@ struct App {
     pending_selected_id: Option<String>,
     pending_selected_index: Option<usize>,
     pending_selected_offset: Option<usize>,
+    // grouped view
+    grouped_mode: bool,
+    expanded_paths: HashSet<String>,
+    display_rows: Vec<DisplayRow>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,10 +224,14 @@ impl App {
                 pending_selected_id: None,
                 pending_selected_index: None,
                 pending_selected_offset: None,
+                grouped_mode: load_grouped_mode_pref(),
+                expanded_paths: HashSet::new(),
+                display_rows: vec![],
             };
             if let Some(fp) = filter_pref {
                 app.set_filter(Some(fp));
             }
+            app.rebuild_display_rows();
             return Ok(app);
         }
         // Avoid expensive full-file scans on startup; sort by metadata timestamp only
@@ -297,6 +316,9 @@ impl App {
             pending_selected_id: None,
             pending_selected_index: None,
             pending_selected_offset: None,
+            grouped_mode: load_grouped_mode_pref(),
+            expanded_paths: HashSet::new(),
+            display_rows: vec![],
         };
         if let Some(fp) = filter_pref.clone() {
             app.set_filter(Some(fp));
@@ -304,6 +326,7 @@ impl App {
             app.set_filter(None);
         }
         apply_sort(&mut app);
+        app.rebuild_display_rows();
         Ok(app)
     }
 
@@ -322,10 +345,15 @@ impl App {
         self.clear_pending_list_position();
         self.selected = 0;
         self.top = 0;
+        self.rebuild_display_rows();
     }
 
     fn is_input_active(&self) -> bool {
-        self.list_search_input || self.search_input || self.show_settings_modal || self.rename_input || self.repath_input
+        self.list_search_input
+            || self.search_input
+            || self.show_settings_modal
+            || self.rename_input
+            || self.repath_input
     }
 
     fn clear_pending_list_position(&mut self) {
@@ -369,6 +397,132 @@ impl App {
 
         let kept_offset = offset.min(self.selected);
         self.top = self.selected.saturating_sub(kept_offset);
+    }
+
+    fn rebuild_display_rows(&mut self) {
+        self.display_rows.clear();
+
+        if !self.grouped_mode {
+            // Flat mode: just wrap each row as a Conversation
+            for row in &self.rows {
+                self.display_rows
+                    .push(DisplayRow::Conversation(row.clone()));
+            }
+            return;
+        }
+
+        // Grouped mode: group by path
+        // First, collect groups in order of appearance (preserving sort order)
+        let mut seen_paths: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<RowItem>> = HashMap::new();
+
+        for row in &self.rows {
+            let path = row.path.clone();
+            if !groups.contains_key(&path) {
+                seen_paths.push(path.clone());
+            }
+            groups.entry(path).or_default().push(row.clone());
+        }
+
+        for path in seen_paths {
+            let convos = groups.remove(&path).unwrap_or_default();
+            if convos.is_empty() {
+                continue;
+            }
+
+            // Find newest conversation for preview
+            let newest = convos
+                .iter()
+                .max_by_key(|c| c.date_ms)
+                .cloned()
+                .unwrap_or_else(|| convos[0].clone());
+
+            // Add group header
+            self.display_rows.push(DisplayRow::Group {
+                path: path.clone(),
+                count: convos.len(),
+                newest_date_ms: newest.date_ms,
+                newest_preview: newest.first_msg.clone(),
+            });
+
+            // If this group is expanded, add its conversations
+            if self.expanded_paths.contains(&path) {
+                for convo in convos {
+                    self.display_rows.push(DisplayRow::Conversation(convo));
+                }
+            }
+        }
+    }
+
+    fn toggle_group_at_selected(&mut self) {
+        if let Some(DisplayRow::Group { path, .. }) = self.display_rows.get(self.selected) {
+            let path = path.clone();
+            if self.expanded_paths.contains(&path) {
+                self.expanded_paths.remove(&path);
+            } else {
+                self.expanded_paths.insert(path);
+            }
+            self.rebuild_display_rows();
+        }
+    }
+
+    fn expand_group_at_selected(&mut self) {
+        if let Some(DisplayRow::Group { path, .. }) = self.display_rows.get(self.selected) {
+            if !self.expanded_paths.contains(path) {
+                let path = path.clone();
+                self.expanded_paths.insert(path);
+                self.rebuild_display_rows();
+            }
+        }
+    }
+
+    fn collapse_group_at_selected(&mut self) {
+        match self.display_rows.get(self.selected) {
+            Some(DisplayRow::Group { path, .. }) => {
+                if self.expanded_paths.contains(path) {
+                    let path = path.clone();
+                    self.expanded_paths.remove(&path);
+                    self.rebuild_display_rows();
+                }
+            }
+            Some(DisplayRow::Conversation(row)) => {
+                // If on a conversation, collapse its parent group and move selection to group header
+                let path = row.path.clone();
+                if self.expanded_paths.contains(&path) {
+                    self.expanded_paths.remove(&path);
+                    self.rebuild_display_rows();
+                    // Find the group header for this path
+                    for (i, dr) in self.display_rows.iter().enumerate() {
+                        if let DisplayRow::Group { path: gp, .. } = dr {
+                            if *gp == path {
+                                self.selected = i;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    fn selected_row_item(&self) -> Option<&RowItem> {
+        match self.display_rows.get(self.selected) {
+            Some(DisplayRow::Conversation(row)) => Some(row),
+            Some(DisplayRow::Group { path, .. }) => {
+                // Return the first (newest) conversation in this group
+                self.rows.iter().find(|r| &r.path == path)
+            }
+            None => None,
+        }
+    }
+
+    fn is_group_selected(&self) -> bool {
+        matches!(
+            self.display_rows.get(self.selected),
+            Some(DisplayRow::Group { .. })
+        )
     }
 }
 
@@ -691,7 +845,13 @@ fn language_candidates(token: &str) -> Vec<String> {
         candidates.push(trimmed.replace('#', "sharp"));
     }
     if trimmed.contains('.') {
-    candidates.push(trimmed.split('.').next_back().unwrap_or(trimmed).to_string());
+        candidates.push(
+            trimmed
+                .split('.')
+                .next_back()
+                .unwrap_or(trimmed)
+                .to_string(),
+        );
     }
 
     candidates
@@ -836,15 +996,17 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     } else {
         " watch:off"
     };
+    let grouped_indicator = if app.grouped_mode { " grouped" } else { "" };
     let mut title_text = if let Some(fp) = &app.filter_path {
         format!(
-            " Conversations — {} of {} [{}{}{}{}] [cwd: {}] ",
+            " Conversations — {} of {} [{}{}{}{}{}] [cwd: {}] ",
             app.rows.len(),
             app.all_rows.len(),
             sort_label(app),
             order_label(app),
             sorting_indicator,
             watch_indicator,
+            grouped_indicator,
             chat_reader::short_path(fp)
         )
     } else {
@@ -858,6 +1020,9 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
             watch_indicator
         )
     };
+    if app.grouped_mode && app.filter_path.is_none() {
+        title_text.push_str("[grouped] ");
+    }
     if !app.list_search_query.is_empty() || app.list_search_in_progress {
         if app.list_search_in_progress {
             title_text.push_str(&format!(
@@ -891,38 +1056,84 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     ));
     f.render_widget(Paragraph::new(header_line), chunks[1]);
 
-    // widths computed above
-
+    // Build rows from display_rows
     let rows: Vec<Row> = app
-        .rows
+        .display_rows
         .iter()
         .enumerate()
         .skip(app.top)
         .take(chunks[2].height.max(1) as usize)
-        .map(|(i, r)| {
-            let date = format_time(r.date_ms);
-            let cwd_raw = chat_reader::short_path(&r.path);
-            let cwd = format_path_cell(&cwd_raw, path_w);
-            let msg = &r.first_msg;
-            let mut style = if i % 2 == 0 {
-                Style::default().fg(Color::Gray)
-            } else {
-                Style::default()
-            };
-            if i == app.selected {
-                style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        .map(|(i, dr)| {
+            match dr {
+                DisplayRow::Group {
+                    path,
+                    count,
+                    newest_date_ms,
+                    newest_preview,
+                } => {
+                    let expanded = app.expanded_paths.contains(path);
+                    let arrow = if expanded { "▼" } else { "▶" };
+                    let date = format_time(*newest_date_ms);
+                    let cwd_raw = chat_reader::short_path(path);
+                    let count_str = format!(" ({})", count);
+                    // Reserve space for arrow and count in path column
+                    let path_content = format!("{} {}{}", arrow, cwd_raw, count_str);
+                    let cwd = format_path_cell(&path_content, path_w);
+                    let msg = newest_preview;
+                    let mut style = if i % 2 == 0 {
+                        Style::default().fg(Color::Gray)
+                    } else {
+                        Style::default()
+                    };
+                    if i == app.selected {
+                        style = Style::default().fg(Color::Black).bg(Color::Cyan);
+                    }
+                    let cells: Vec<Cell> = vec![
+                        Cell::from(pad(&date, date_w)),
+                        Cell::from("│".to_string()),
+                        Cell::from(Span::styled(
+                            pad(&cwd, path_w),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Cell::from("│".to_string()),
+                        Cell::from(pad(msg, msg_w)),
+                    ];
+                    Row::new(cells).style(style)
+                }
+                DisplayRow::Conversation(r) => {
+                    let date = format_time(r.date_ms);
+                    let cwd_raw = chat_reader::short_path(&r.path);
+                    // Indent conversations under groups
+                    let cwd_display = if app.grouped_mode {
+                        format!("  {}", cwd_raw)
+                    } else {
+                        cwd_raw
+                    };
+                    let cwd = format_path_cell(&cwd_display, path_w);
+                    let msg = &r.first_msg;
+                    let mut style = if i % 2 == 0 {
+                        Style::default().fg(Color::Gray)
+                    } else {
+                        Style::default()
+                    };
+                    if i == app.selected {
+                        style = Style::default().fg(Color::Black).bg(Color::Cyan);
+                    }
+                    let cells: Vec<Cell> = vec![
+                        Cell::from(pad(&date, date_w)),
+                        Cell::from("│".to_string()),
+                        Cell::from(Span::styled(
+                            pad(&cwd, path_w),
+                            Style::default().fg(Color::Green),
+                        )),
+                        Cell::from("│".to_string()),
+                        Cell::from(pad(msg, msg_w)),
+                    ];
+                    Row::new(cells).style(style)
+                }
             }
-            let cells: Vec<Cell> = vec![
-                Cell::from(pad(&date, date_w)),
-                Cell::from("│".to_string()),
-                Cell::from(Span::styled(
-                    pad(&cwd, path_w),
-                    Style::default().fg(Color::Green),
-                )),
-                Cell::from("│".to_string()),
-                Cell::from(pad(msg, msg_w)),
-            ];
-            Row::new(cells).style(style)
         })
         .collect();
 
@@ -946,8 +1157,10 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
         format!("Rename: {}_  — Enter save  Esc cancel", app.rename_query)
     } else if app.repath_input {
         format!("Path: {}_  — Enter save  Esc cancel", app.repath_query)
+    } else if app.grouped_mode {
+        " ↑/↓ move   Enter expand/open   ←/→ collapse/expand   Tab flat view   / search   s sort   o order   e export   a archive   q quit ".to_string()
     } else {
-        " ↑/↓ move   PgUp/PgDn page   Home/g top   End/G bottom   Enter open   a archive   u undo   f filter cwd   / search   s sort key   o order   e export   n rename   p repath   i info   , settings   r resume   x clear   q quit ".to_string()
+        " ↑/↓ move   Enter open   Tab grouped   f filter cwd   / search   s sort key   o order   e export   n rename   a archive   q quit ".to_string()
     };
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
@@ -1141,7 +1354,14 @@ fn handle_view_mouse_event(app: &mut App, mouse: &MouseEvent, viewport: Rect) ->
 }
 
 fn open_selected_session(app: &mut App, viewport_height: Option<u16>) {
-    if let Some(row) = app.rows.get(app.selected) {
+    // Get the conversation row from display_rows
+    let row = match app.display_rows.get(app.selected) {
+        Some(DisplayRow::Conversation(r)) => Some(r.clone()),
+        Some(DisplayRow::Group { .. }) => None, // Don't open on group headers
+        None => None,
+    };
+
+    if let Some(row) = row {
         let msgs = if let Some(cached) = app.messages_cache.get(&row.id) {
             cached.clone()
         } else {
@@ -1173,11 +1393,12 @@ fn open_selected_session(app: &mut App, viewport_height: Option<u16>) {
 }
 
 fn archive_selected_session(app: &mut App) -> Result<()> {
-    let selected_row = app
-        .rows
-        .get(app.selected)
-        .cloned()
-        .ok_or_else(|| anyhow!("No session selected"))?;
+    // Get the conversation row from display_rows
+    let selected_row = match app.display_rows.get(app.selected) {
+        Some(DisplayRow::Conversation(r)) => r.clone(),
+        Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot archive a group header")),
+        None => return Err(anyhow!("No session selected")),
+    };
 
     let original_path = PathBuf::from(&selected_row.file_path);
     if !original_path.exists() {
@@ -1209,6 +1430,7 @@ fn archive_selected_session(app: &mut App) -> Result<()> {
     let _ = remove_row_by_id(&mut app.all_rows, &selected_row.id);
     let _ = remove_row_by_id(&mut app.rows, &selected_row.id);
 
+    app.rebuild_display_rows();
     adjust_selection_after_change(app);
 
     app.last_archived = Some(ArchivedAction {
@@ -1221,18 +1443,18 @@ fn archive_selected_session(app: &mut App) -> Result<()> {
 }
 
 fn generate_uuid() -> Result<String> {
-    let output = std::process::Command::new("uuidgen")
-        .output()?;
+    let output = std::process::Command::new("uuidgen").output()?;
     let s = String::from_utf8(output.stdout)?;
     Ok(s.trim().to_lowercase())
 }
 
 fn duplicate_selected_session(app: &mut App) -> Result<()> {
-    let selected_row = app
-        .rows
-        .get(app.selected)
-        .cloned()
-        .ok_or_else(|| anyhow!("No session selected"))?;
+    // Get the conversation row from display_rows
+    let selected_row = match app.display_rows.get(app.selected) {
+        Some(DisplayRow::Conversation(r)) => r.clone(),
+        Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot duplicate a group header")),
+        None => return Err(anyhow!("No session selected")),
+    };
 
     let original_path = PathBuf::from(&selected_row.file_path);
     if !original_path.exists() {
@@ -1292,11 +1514,12 @@ fn duplicate_selected_session(app: &mut App) -> Result<()> {
 }
 
 fn rename_selected_session(app: &mut App) -> Result<()> {
-    let selected_row = app
-        .rows
-        .get(app.selected)
-        .cloned()
-        .ok_or_else(|| anyhow!("No session selected"))?;
+    // Get the conversation row from display_rows
+    let selected_row = match app.display_rows.get(app.selected) {
+        Some(DisplayRow::Conversation(r)) => r.clone(),
+        Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot rename a group header")),
+        None => return Err(anyhow!("No session selected")),
+    };
 
     let original_path = PathBuf::from(&selected_row.file_path);
     if !original_path.exists() {
@@ -1361,15 +1584,16 @@ fn rename_selected_session(app: &mut App) -> Result<()> {
 /// e.g., "/Users/js/code/visma.admin" -> "-Users-js-code-visma-admin"
 /// Claude replaces both '/' and '.' with '-'
 fn encode_path_to_dir_name(path: &str) -> String {
-    path.replace('/', "-").replace('.', "-")
+    path.replace(['/', '.'], "-")
 }
 
 fn repath_selected_session(app: &mut App) -> Result<()> {
-    let selected_row = app
-        .rows
-        .get(app.selected)
-        .cloned()
-        .ok_or_else(|| anyhow!("No session selected"))?;
+    // Get the conversation row from display_rows
+    let selected_row = match app.display_rows.get(app.selected) {
+        Some(DisplayRow::Conversation(r)) => r.clone(),
+        Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot repath a group header")),
+        None => return Err(anyhow!("No session selected")),
+    };
 
     let original_file_path = PathBuf::from(&selected_row.file_path);
     if !original_file_path.exists() {
@@ -1410,7 +1634,9 @@ fn repath_selected_session(app: &mut App) -> Result<()> {
     // If the paths are the same, just update metadata
     if new_file_path == original_file_path {
         // Only need to update the cwd metadata inside the file
-        let parent = original_file_path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = original_file_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
         let temp_uuid = generate_uuid()?;
         let temp_path = parent.join(format!(".repath-{}.tmp", temp_uuid));
 
@@ -1587,7 +1813,9 @@ fn archive_root_dir(projects_dir: &Path) -> PathBuf {
 }
 
 fn remove_row_by_id(rows: &mut Vec<RowItem>, id: &str) -> Option<RowItem> {
-    rows.iter().position(|r| r.id == id).map(|idx| rows.remove(idx))
+    rows.iter()
+        .position(|r| r.id == id)
+        .map(|idx| rows.remove(idx))
 }
 
 fn sort_rows_by(rows: &mut [RowItem], key: SortKey, desc: bool) {
@@ -1623,21 +1851,22 @@ fn sort_rows_by(rows: &mut [RowItem], key: SortKey, desc: bool) {
 }
 
 fn adjust_selection_after_change(app: &mut App) {
-    if app.rows.is_empty() {
+    let row_count = app.display_rows.len();
+    if row_count == 0 {
         app.selected = 0;
         app.top = 0;
         return;
     }
 
-    if app.selected >= app.rows.len() {
-        app.selected = app.rows.len() - 1;
+    if app.selected >= row_count {
+        app.selected = row_count - 1;
     }
 
     if app.top > app.selected {
         app.top = app.selected;
     }
 
-    let max_top = app.rows.len().saturating_sub(1);
+    let max_top = row_count.saturating_sub(1);
     if app.top > max_top {
         app.top = max_top;
     }
@@ -1834,10 +2063,7 @@ fn format_path_cell(path: &str, width: usize) -> String {
 
         if !collapsed_prefix && !segments.is_empty() {
             if segments.len() > 1 {
-                let new_segments = vec![
-                    segments[0].clone(),
-                    PathSegment::literal("…/"),
-                ];
+                let new_segments = vec![segments[0].clone(), PathSegment::literal("…/")];
                 segments = new_segments;
             } else {
                 segments = vec![PathSegment::literal("…/")];
@@ -2024,7 +2250,6 @@ fn set_view_scroll(app: &mut App, value: usize, view_height: usize) {
     app.view_scroll = capped as u16;
 }
 
-
 fn render_message_lines(
     msgs: &[Message],
     show_tools: bool,
@@ -2044,7 +2269,12 @@ fn refresh_view_after_tool_toggle(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) {
-    if let Some(id) = app.rows.get(app.selected).map(|r| r.id.clone()) {
+    // Get the id of the currently viewed conversation
+    let id = match app.display_rows.get(app.selected) {
+        Some(DisplayRow::Conversation(row)) => Some(row.id.clone()),
+        _ => None,
+    };
+    if let Some(id) = id {
         if !app.messages_cache.contains_key(&id) {
             if let Ok((_, msgs)) = app.reader.get_messages_by_id(&id) {
                 app.messages_cache.insert(id.clone(), msgs);
@@ -2824,6 +3054,7 @@ fn main() -> Result<()> {
             crossterm::terminal::disable_raw_mode()?;
             crossterm::execute!(
                 terminal.backend_mut(),
+                crossterm::cursor::Show,
                 crossterm::event::DisableMouseCapture,
                 crossterm::terminal::LeaveAlternateScreen
             )?;
@@ -2853,6 +3084,7 @@ fn main() -> Result<()> {
                             terminal.backend_mut(),
                             crossterm::terminal::EnterAlternateScreen,
                             crossterm::event::EnableMouseCapture,
+                            crossterm::cursor::Hide,
                             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
                         )?;
                         terminal.clear()?;
@@ -2990,9 +3222,14 @@ fn main() -> Result<()> {
                                             load_quit_after_launch_pref();
                                     }
                                     KeyCode::Char('r') if !app.is_input_active() => {
-                                        if let Some(row) = app.rows.get(app.selected) {
-                                            app.resume_session_request =
-                                                Some((row.id.clone(), row.path.clone()));
+                                        // Resume: skip if on a group header
+                                        if !app.is_group_selected() {
+                                            if let Some(DisplayRow::Conversation(row)) =
+                                                app.display_rows.get(app.selected)
+                                            {
+                                                app.resume_session_request =
+                                                    Some((row.id.clone(), row.path.clone()));
+                                            }
                                         }
                                     }
                                     KeyCode::Char('a') if !app.is_input_active() => {
@@ -3006,20 +3243,25 @@ fn main() -> Result<()> {
                                         }
                                     }
                                     KeyCode::Char('n') if !app.is_input_active() => {
-                                        if let Some(row) = app.rows.get(app.selected) {
-                                            app.rename_input = true;
-                                            // Start with the current summary/first msg as the default value
-                                            // We use the row's first_msg which is already a preview,
-                                            // but it's better than nothing. Ideally we would read the full summary
-                                            // from file, but that might be slow.
-                                            app.rename_query = row.first_msg.clone();
+                                        // Rename: skip if on a group header
+                                        if !app.is_group_selected() {
+                                            if let Some(DisplayRow::Conversation(row)) =
+                                                app.display_rows.get(app.selected)
+                                            {
+                                                app.rename_input = true;
+                                                app.rename_query = row.first_msg.clone();
+                                            }
                                         }
                                     }
                                     KeyCode::Char('p') if !app.is_input_active() => {
-                                        if let Some(row) = app.rows.get(app.selected) {
-                                            app.repath_input = true;
-                                            // Start with the current path as the default value
-                                            app.repath_query = row.path.clone();
+                                        // Repath: skip if on a group header
+                                        if !app.is_group_selected() {
+                                            if let Some(DisplayRow::Conversation(row)) =
+                                                app.display_rows.get(app.selected)
+                                            {
+                                                app.repath_input = true;
+                                                app.repath_query = row.path.clone();
+                                            }
                                         }
                                     }
                                     KeyCode::Char('u') if !app.is_input_active() => {
@@ -3124,7 +3366,8 @@ fn main() -> Result<()> {
                                         }
                                     }
                                     KeyCode::Down if !app.show_settings_modal => {
-                                        if app.selected + 1 < app.rows.len() {
+                                        let row_count = app.display_rows.len();
+                                        if app.selected + 1 < row_count {
                                             app.selected += 1;
                                             if let Ok(size) = terminal.size() {
                                                 let view_h = list_visible_height(size.height);
@@ -3146,7 +3389,8 @@ fn main() -> Result<()> {
                                     KeyCode::PageDown => {
                                         if let Ok(size) = terminal.size() {
                                             let view_h = list_visible_height(size.height);
-                                            let last_index = app.rows.len().saturating_sub(1);
+                                            let last_index =
+                                                app.display_rows.len().saturating_sub(1);
                                             app.selected = (app.selected + view_h).min(last_index);
                                             adjust_list_window(&mut app, view_h);
                                         }
@@ -3158,8 +3402,8 @@ fn main() -> Result<()> {
                                         app.top = 0;
                                     }
                                     KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
-                                        if !app.rows.is_empty() {
-                                            app.selected = app.rows.len() - 1;
+                                        if !app.display_rows.is_empty() {
+                                            app.selected = app.display_rows.len() - 1;
                                             if let Ok(size) = terminal.size() {
                                                 let view_h = list_visible_height(size.height);
                                                 adjust_list_window(&mut app, view_h);
@@ -3167,16 +3411,44 @@ fn main() -> Result<()> {
                                         }
                                     }
                                     KeyCode::Enter => {
-                                        let height = terminal.size().ok().map(|sz| sz.height);
-                                        open_selected_session(&mut app, height);
+                                        // In grouped mode, Enter on a group toggles expand
+                                        if app.grouped_mode && app.is_group_selected() {
+                                            app.toggle_group_at_selected();
+                                        } else {
+                                            let height = terminal.size().ok().map(|sz| sz.height);
+                                            open_selected_session(&mut app, height);
+                                        }
+                                    }
+                                    KeyCode::Right if !app.is_input_active() => {
+                                        // Expand group or do nothing
+                                        if app.grouped_mode && app.is_group_selected() {
+                                            app.expand_group_at_selected();
+                                        }
+                                    }
+                                    KeyCode::Left if !app.is_input_active() => {
+                                        // Collapse group (or parent group if on conversation)
+                                        if app.grouped_mode {
+                                            app.collapse_group_at_selected();
+                                        }
                                     }
                                     KeyCode::Char('f') if !app.is_input_active() => {
-                                        if let Some(row) = app.rows.get(app.selected) {
-                                            if !row.path.is_empty() {
-                                                let chosen = row.path.clone();
-                                                app.set_filter(Some(chosen.clone()));
-                                                let _ = save_filter_pref(Some(&chosen));
+                                        // Filter by path: works on both groups and conversations
+                                        let path_opt = match app.display_rows.get(app.selected) {
+                                            Some(DisplayRow::Group { path, .. }) => {
+                                                Some(path.clone())
                                             }
+                                            Some(DisplayRow::Conversation(row)) => {
+                                                if !row.path.is_empty() {
+                                                    Some(row.path.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            }
+                                            None => None,
+                                        };
+                                        if let Some(chosen) = path_opt {
+                                            app.set_filter(Some(chosen.clone()));
+                                            let _ = save_filter_pref(Some(&chosen));
                                         }
                                     }
                                     KeyCode::Char('x') if !app.is_input_active() => {
@@ -3187,16 +3459,32 @@ fn main() -> Result<()> {
                                             app.rows = app.all_rows.clone();
                                             app.selected = 0;
                                             app.top = 0;
+                                            app.rebuild_display_rows();
                                         }
                                     }
+                                    KeyCode::Tab if !app.is_input_active() => {
+                                        // Toggle grouped mode
+                                        app.grouped_mode = !app.grouped_mode;
+                                        let _ = save_grouped_mode_pref(app.grouped_mode);
+                                        app.expanded_paths.clear();
+                                        app.selected = 0;
+                                        app.top = 0;
+                                        app.rebuild_display_rows();
+                                    }
                                     KeyCode::Char('e') if !app.is_input_active() => {
-                                        if let Some(row) = app.rows.get(app.selected) {
-                                            if let Some(msgs) = app.messages_cache.get(&row.id) {
-                                                let title = &row.id;
-                                                if let Ok(path) =
-                                                    export_html(title, &row.path, msgs)
+                                        // Export: skip if on a group header
+                                        if !app.is_group_selected() {
+                                            if let Some(DisplayRow::Conversation(row)) =
+                                                app.display_rows.get(app.selected)
+                                            {
+                                                if let Some(msgs) = app.messages_cache.get(&row.id)
                                                 {
-                                                    let _ = open::that(path);
+                                                    let title = &row.id;
+                                                    if let Ok(path) =
+                                                        export_html(title, &row.path, msgs)
+                                                    {
+                                                        let _ = open::that(path);
+                                                    }
                                                 }
                                             }
                                         }
@@ -3408,7 +3696,10 @@ fn main() -> Result<()> {
                                         app.repath_query.push(c);
                                     }
                                     KeyCode::Char('e') if !app.is_input_active() => {
-                                        if let Some(row) = app.rows.get(app.selected) {
+                                        // In View mode, get the current conversation
+                                        if let Some(DisplayRow::Conversation(row)) =
+                                            app.display_rows.get(app.selected)
+                                        {
                                             if let Some(msgs) = app.messages_cache.get(&row.id) {
                                                 let title = &row.id;
                                                 if let Ok(path) =
@@ -3453,13 +3744,17 @@ fn main() -> Result<()> {
                                         )?;
                                     }
                                     KeyCode::Char('r') if !app.is_input_active() => {
-                                        if let Some(row) = app.rows.get(app.selected) {
+                                        if let Some(DisplayRow::Conversation(row)) =
+                                            app.display_rows.get(app.selected)
+                                        {
                                             app.resume_session_request =
                                                 Some((row.id.clone(), row.path.clone()));
                                         }
                                     }
                                     KeyCode::Char('p') if !app.is_input_active() => {
-                                        if let Some(row) = app.rows.get(app.selected) {
+                                        if let Some(DisplayRow::Conversation(row)) =
+                                            app.display_rows.get(app.selected)
+                                        {
                                             app.repath_input = true;
                                             app.repath_query = row.path.clone();
                                         }
@@ -3973,6 +4268,20 @@ fn load_quit_after_launch_pref() -> bool {
 fn save_quit_after_launch_pref(quit_after_launch: bool) -> Result<()> {
     let mut v = read_config_json();
     v["quit_after_launch"] = serde_json::json!(quit_after_launch);
+    write_config_json(&v)?;
+    Ok(())
+}
+
+fn load_grouped_mode_pref() -> bool {
+    let v = read_config_json();
+    v.get("grouped_mode")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true) // default: grouped mode enabled
+}
+
+fn save_grouped_mode_pref(grouped: bool) -> Result<()> {
+    let mut v = read_config_json();
+    v["grouped_mode"] = serde_json::json!(grouped);
     write_config_json(&v)?;
     Ok(())
 }
