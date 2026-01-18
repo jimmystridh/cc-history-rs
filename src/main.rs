@@ -88,6 +88,8 @@ struct FirstMsgResult {
 struct App {
     reader: ChatReader,
     projects_dir: PathBuf,
+    base_projects_dir: PathBuf, // original ~/.claude/projects
+    viewing_archive: bool,
     all_rows: Vec<RowItem>,
     rows: Vec<RowItem>,
     messages_cache: HashMap<String, Vec<Message>>,
@@ -127,6 +129,7 @@ struct App {
     fs_ping_rx: Option<Receiver<Vec<PathBuf>>>,
     watcher_enabled: bool,
     last_renamed: Option<(PathBuf, Instant)>,
+    fs_debounce_until: Option<Instant>, // debounce FS events - don't refresh until this time
     // info modal
     show_info_modal: bool,
     // help modal
@@ -173,6 +176,8 @@ impl App {
             let mut app = Self {
                 reader,
                 projects_dir: projects_dir.clone(),
+                base_projects_dir: projects_dir.clone(),
+                viewing_archive: false,
                 all_rows: vec![],
                 rows: vec![],
                 messages_cache: HashMap::new(),
@@ -211,6 +216,7 @@ impl App {
                 },
                 watcher_enabled: watch_pref,
                 last_renamed: None,
+                fs_debounce_until: None,
                 show_info_modal: false,
                 show_help_modal: false,
                 show_settings_modal: false,
@@ -269,6 +275,8 @@ impl App {
         let mut app = Self {
             reader,
             projects_dir: projects_dir.clone(),
+            base_projects_dir: projects_dir.clone(),
+            viewing_archive: false,
             all_rows: rows.clone(),
             rows,
             messages_cache: cache,
@@ -303,6 +311,7 @@ impl App {
             fs_ping_rx: ping_rx,
             watcher_enabled: watch_pref,
             last_renamed: None,
+            fs_debounce_until: None,
             show_info_modal: false,
             show_help_modal: false,
             show_settings_modal: false,
@@ -363,8 +372,17 @@ impl App {
     }
 
     fn snapshot_list_position(&mut self) {
-        if let Some(row) = self.rows.get(self.selected) {
-            self.pending_selected_id = Some(row.id.clone());
+        // Get the ID from display_rows (not rows) since selected indexes into display_rows
+        let id = match self.display_rows.get(self.selected) {
+            Some(DisplayRow::Conversation(row)) => Some(row.id.clone()),
+            Some(DisplayRow::Group { path, .. }) => {
+                // For group headers, find the first conversation in that group
+                self.rows.iter().find(|r| &r.path == path).map(|r| r.id.clone())
+            }
+            None => None,
+        };
+        if let Some(id) = id {
+            self.pending_selected_id = Some(id);
             self.pending_selected_index = Some(self.selected);
             self.pending_selected_offset = Some(self.selected.saturating_sub(self.top));
         } else {
@@ -373,26 +391,32 @@ impl App {
     }
 
     fn restore_list_position(&mut self) {
+        // Must rebuild display_rows first since rows changed
+        self.rebuild_display_rows();
+
         let saved_id = self.pending_selected_id.take();
         let saved_index = self.pending_selected_index.take();
         let offset = self.pending_selected_offset.take().unwrap_or(0);
 
-        if self.rows.is_empty() {
+        if self.display_rows.is_empty() {
             self.selected = 0;
             self.top = 0;
             return;
         }
 
         let mut target_index =
-            saved_index.unwrap_or_else(|| self.selected.min(self.rows.len().saturating_sub(1)));
+            saved_index.unwrap_or_else(|| self.selected.min(self.display_rows.len().saturating_sub(1)));
 
         if let Some(id) = saved_id {
-            if let Some(pos) = self.rows.iter().position(|r| r.id == id) {
+            // Search display_rows for a conversation with matching ID
+            if let Some(pos) = self.display_rows.iter().position(|dr| {
+                matches!(dr, DisplayRow::Conversation(r) if r.id == id)
+            }) {
                 target_index = pos;
             }
         }
 
-        target_index = target_index.min(self.rows.len().saturating_sub(1));
+        target_index = target_index.min(self.display_rows.len().saturating_sub(1));
         self.selected = target_index;
 
         let kept_offset = offset.min(self.selected);
@@ -523,6 +547,69 @@ impl App {
             self.display_rows.get(self.selected),
             Some(DisplayRow::Group { .. })
         )
+    }
+
+    fn toggle_archive_view(&mut self) {
+        self.viewing_archive = !self.viewing_archive;
+        let new_dir = if self.viewing_archive {
+            archive_root_dir(&self.base_projects_dir)
+        } else {
+            self.base_projects_dir.clone()
+        };
+        self.projects_dir = new_dir.clone();
+        self.reader = ChatReader::with_projects_dir(new_dir.clone());
+
+        // Clear current state
+        self.all_rows.clear();
+        self.rows.clear();
+        self.messages_cache.clear();
+        self.first_msg_pending.clear();
+        self.filter_path = None;
+        self.list_search_query.clear();
+        self.list_search_input = false;
+        self.expanded_paths.clear();
+        self.selected = 0;
+        self.top = 0;
+        self.last_archived = None;
+
+        // Restart first message loader for new directory
+        let (first_msg_tx, first_msg_rx) = spawn_first_msg_loader(new_dir.clone());
+        self.first_msg_tx = Some(first_msg_tx);
+        self.first_msg_rx = Some(first_msg_rx);
+
+        // Restart FS watcher if enabled
+        if self.watcher_enabled {
+            self.fs_ping_rx = spawn_initial_fs_watcher(&new_dir);
+        }
+
+        // Load conversations from the new directory
+        if let Ok(convos) = self.reader.list_conversations() {
+            let mut rows: Vec<RowItem> = convos
+                .into_iter()
+                .map(|c| {
+                    let summary_preview = c
+                        .summary
+                        .as_ref()
+                        .map(|s| single_line_preview(s, 240))
+                        .unwrap_or_default();
+                    RowItem {
+                        id: c.id,
+                        date_ms: c.created_at.unwrap_or(0),
+                        path: c.path.unwrap_or_default(),
+                        first_msg: summary_preview,
+                        file_path: c.file.display().to_string(),
+                        last_msg_ms: None,
+                    }
+                })
+                .collect();
+
+            // Apply default sort
+            sort_rows_by(&mut rows, self.sort_key, self.sort_desc);
+            self.all_rows = rows.clone();
+            self.rows = rows;
+        }
+
+        self.rebuild_display_rows();
     }
 }
 
@@ -997,9 +1084,15 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
         " watch:off"
     };
     let grouped_indicator = if app.grouped_mode { " grouped" } else { "" };
+    let view_name = if app.viewing_archive {
+        "Archive"
+    } else {
+        "Conversations"
+    };
     let mut title_text = if let Some(fp) = &app.filter_path {
         format!(
-            " Conversations — {} of {} [{}{}{}{}{}] [cwd: {}] ",
+            " {} — {} of {} [{}{}{}{}{}] [cwd: {}] ",
+            view_name,
             app.rows.len(),
             app.all_rows.len(),
             sort_label(app),
@@ -1011,7 +1104,8 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
         )
     } else {
         format!(
-            " Conversations — {} of {} [{}{}{}{}] ",
+            " {} — {} of {} [{}{}{}{}] ",
+            view_name,
             app.rows.len(),
             app.all_rows.len(),
             sort_label(app),
@@ -1151,6 +1245,11 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
     f.render_widget(table, chunks[2]);
 
+    let archive_action = if app.viewing_archive {
+        "a restore"
+    } else {
+        "a archive"
+    };
     let footer_text = if app.list_search_input {
         format!("/{}  — Enter run  Esc cancel", app.list_search_query)
     } else if app.rename_input {
@@ -1158,9 +1257,9 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     } else if app.repath_input {
         format!("Path: {}_  — Enter save  Esc cancel", app.repath_query)
     } else if app.grouped_mode {
-        " ↑/↓ move   Enter expand/open   ←/→ collapse/expand   Tab flat view   / search   s sort   o order   e export   a archive   q quit ".to_string()
+        format!(" ↑/↓ move   Enter expand/open   ←/→ collapse/expand   Tab flat view   / search   s sort   o order   e export   {}   A toggle archive   q quit ", archive_action)
     } else {
-        " ↑/↓ move   Enter open   Tab grouped   f filter cwd   / search   s sort key   o order   e export   n rename   a archive   q quit ".to_string()
+        format!(" ↑/↓ move   Enter open   Tab grouped   f filter cwd   / search   s sort key   o order   e export   n rename   {}   A toggle archive   q quit ", archive_action)
     };
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
@@ -1196,23 +1295,33 @@ fn render_view(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .scroll((app.view_scroll, 0));
     f.render_widget(para, chunks[1]);
 
+    let archive_action = if app.viewing_archive {
+        "a restore"
+    } else {
+        "a archive"
+    };
     let footer_text = if app.search_input {
         format!("/{}", app.search_query)
     } else if app.repath_input {
         format!("Path: {}_  — Enter save  Esc cancel", app.repath_query)
     } else if !app.search_query.is_empty() {
         if app.search_matches.is_empty() {
-            String::from(" 0/0 — / to search — t toggle tools — T expand/collapse — a archive ")
+            format!(
+                " 0/0 — / to search — t toggle tools — T expand/collapse — {} ",
+                archive_action
+            )
         } else {
             format!(
-                " {}/{} — n/N next/prev — / new search — t toggle tools — T expand/collapse — a archive ",
+                " {}/{} — n/N next/prev — / new search — t toggle tools — T expand/collapse — {} ",
                 app.search_index + 1,
-                app.search_matches.len()
+                app.search_matches.len(),
+                archive_action
             )
         }
     } else {
-        String::from(
-            " ↑/↓ scroll   PgUp/PgDn page   Home/g top   End/G bottom   / search   t toggle tools   T expand/collapse   Esc/q back   i info   r resume   e export   a archive   u undo   p repath ",
+        format!(
+            " ↑/↓ scroll   PgUp/PgDn page   Home/g top   End/G bottom   / search   t toggle tools   T expand/collapse   Esc/q back   i info   r resume   e export   {}   u undo   p repath ",
+            archive_action
         )
     };
     let footer = Paragraph::new(Line::from(Span::styled(
@@ -1436,6 +1545,62 @@ fn archive_selected_session(app: &mut App) -> Result<()> {
     app.last_archived = Some(ArchivedAction {
         row: selected_row,
         original_path,
+        archived_path,
+    });
+
+    Ok(())
+}
+
+fn unarchive_selected_session(app: &mut App) -> Result<()> {
+    // This function restores a session from archive back to projects
+    let selected_row = match app.display_rows.get(app.selected) {
+        Some(DisplayRow::Conversation(r)) => r.clone(),
+        Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot unarchive a group header")),
+        None => return Err(anyhow!("No session selected")),
+    };
+
+    let archived_path = PathBuf::from(&selected_row.file_path);
+    if !archived_path.exists() {
+        return Err(anyhow!(
+            "Archived session file not found at {}",
+            archived_path.display()
+        ));
+    }
+
+    // Compute the relative path within the archive directory
+    let archive_root = archive_root_dir(&app.base_projects_dir);
+    let relative_path = compute_relative_path(&archived_path, &archive_root)?;
+
+    // Destination is in the base projects directory
+    let restored_path = app.base_projects_dir.join(&relative_path);
+
+    if restored_path.exists() {
+        return Err(anyhow!(
+            "Destination already exists: {}",
+            restored_path.display()
+        ));
+    }
+
+    if let Some(parent) = restored_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::rename(&archived_path, &restored_path)?;
+
+    // Remove from current view
+    app.messages_cache.remove(&selected_row.id);
+    app.first_msg_pending.remove(&selected_row.id);
+    let _ = remove_row_by_id(&mut app.all_rows, &selected_row.id);
+    let _ = remove_row_by_id(&mut app.rows, &selected_row.id);
+
+    app.rebuild_display_rows();
+    adjust_selection_after_change(app);
+
+    // Store the action for potential undo (reversed: archived_path is where it was,
+    // original_path is where it's going)
+    app.last_archived = Some(ArchivedAction {
+        row: selected_row,
+        original_path: restored_path,
         archived_path,
     });
 
@@ -1732,6 +1897,8 @@ fn repath_selected_session(app: &mut App) -> Result<()> {
         row.path = new_path_str;
         row.file_path = new_file_path_str;
     }
+
+    app.rebuild_display_rows();
 
     Ok(())
 }
@@ -2558,11 +2725,12 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line("x", "Clear filters and search"));
     lines.push(shortcut_line("w", "Toggle filesystem watcher"));
     lines.push(shortcut_line("r", "Resume session in shell"));
-    lines.push(shortcut_line("a", "Archive selected session"));
+    lines.push(shortcut_line("a", "Archive/restore selected session"));
+    lines.push(shortcut_line("A", "Toggle archive view"));
     lines.push(shortcut_line("d", "Duplicate selected session"));
     lines.push(shortcut_line("n", "Rename selected session"));
     lines.push(shortcut_line("p", "Change session base directory"));
-    lines.push(shortcut_line("u", "Undo last archive"));
+    lines.push(shortcut_line("u", "Undo last archive/restore"));
     lines.push(shortcut_line("e", "Export session to HTML"));
 
     lines.push(Line::from(""));
@@ -2578,9 +2746,10 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line("t", "Show or hide tool calls"));
     lines.push(shortcut_line("T", "Expand or collapse tool calls"));
     lines.push(shortcut_line("r", "Resume session in shell"));
-    lines.push(shortcut_line("a", "Archive session"));
+    lines.push(shortcut_line("a", "Archive/restore session"));
+    lines.push(shortcut_line("A", "Toggle archive view"));
     lines.push(shortcut_line("p", "Change session base directory"));
-    lines.push(shortcut_line("u", "Undo last archive"));
+    lines.push(shortcut_line("u", "Undo last archive/restore"));
     lines.push(shortcut_line("e", "Export session to HTML"));
 
     lines.push(Line::from(""));
@@ -2928,6 +3097,7 @@ fn main() -> Result<()> {
                     app.rows = new_rows;
                     app.sort_rx = None;
                     app.sorting_in_progress = false;
+                    app.rebuild_display_rows();
                     needs_redraw = true;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -2947,6 +3117,7 @@ fn main() -> Result<()> {
                     app.list_search_in_progress = false;
                     app.selected = 0;
                     app.top = 0;
+                    app.rebuild_display_rows();
                     needs_redraw = true;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -2961,7 +3132,27 @@ fn main() -> Result<()> {
         if let Some(rx) = &app.update_rx {
             match rx.try_recv() {
                 Ok(new_all) => {
-                    app.all_rows = new_all;
+                    // Filter out any sessions whose files no longer exist (may have been
+                    // archived/deleted between when the refresh started and now)
+                    let mut new_rows: Vec<RowItem> = new_all
+                        .into_iter()
+                        .filter(|r| Path::new(&r.file_path).exists())
+                        .collect();
+
+                    // Preserve first_msg values that were loaded asynchronously.
+                    // The refresh only has summary-based first_msg, so we keep
+                    // any non-empty first_msg from the old rows.
+                    for new_row in &mut new_rows {
+                        if new_row.first_msg.is_empty() {
+                            if let Some(old_row) = app.all_rows.iter().find(|r| r.id == new_row.id) {
+                                if !old_row.first_msg.is_empty() {
+                                    new_row.first_msg = old_row.first_msg.clone();
+                                }
+                            }
+                        }
+                    }
+
+                    app.all_rows = new_rows;
                     app.update_rx = None;
                     app.updating_in_progress = false;
                     // Reapply search/filter/sort state
@@ -2993,6 +3184,9 @@ fn main() -> Result<()> {
             }
         }
         // Apply async first message results
+        // Collect display updates to apply after channel processing (to avoid borrow conflicts)
+        let mut display_updates: Vec<(String, String)> = Vec::new();
+        let mut channel_disconnected = false;
         if let Some(rx) = &app.first_msg_rx {
             loop {
                 match rx.try_recv() {
@@ -3011,40 +3205,58 @@ fn main() -> Result<()> {
                                 row.first_msg = first.clone();
                             }
                             if let Some(row) = app.rows.iter_mut().find(|r| r.id == id) {
-                                row.first_msg = first;
+                                row.first_msg = first.clone();
                             }
+                            // Queue display_rows update for after the loop
+                            display_updates.push((id, first));
                         }
                         needs_redraw = true;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        app.first_msg_rx = None;
+                        channel_disconnected = true;
                         needs_redraw = true;
                         break;
                     }
                 }
             }
         }
-        // React to FS ping
+        if channel_disconnected {
+            app.first_msg_rx = None;
+        }
+        // Apply queued display_rows updates
+        for (id, first) in display_updates {
+            update_display_row_first_msg(&mut app, &id, &first);
+        }
+        // React to FS ping - debounce by collecting events and waiting for quiet period
         if let Some(prx) = &app.fs_ping_rx {
-            if let Ok(paths) = prx.try_recv() {
-                if !app.updating_in_progress {
-                    let mut ignore = false;
-                    if let Some((renamed_path, time)) = &app.last_renamed {
-                        if time.elapsed() < Duration::from_secs(2) {
-                            if paths.iter().any(|p| p == renamed_path) {
-                                ignore = true;
-                            }
-                        } else {
-                            app.last_renamed = None;
+            let mut got_events = false;
+            let mut ignore_all = false;
+            // Drain all pending events
+            while let Ok(paths) = prx.try_recv() {
+                got_events = true;
+                // Check if this is a recently renamed file we should ignore
+                if let Some((renamed_path, time)) = &app.last_renamed {
+                    if time.elapsed() < Duration::from_secs(2) {
+                        if paths.iter().any(|p| p == renamed_path) {
+                            ignore_all = true;
                         }
-                    }
-
-                    if !ignore {
-                        spawn_full_refresh(&mut app);
-                        needs_redraw = true;
+                    } else {
+                        app.last_renamed = None;
                     }
                 }
+            }
+            // If we got events, reset the debounce timer (wait 500ms after last event)
+            if got_events && !ignore_all {
+                app.fs_debounce_until = Some(Instant::now() + Duration::from_millis(500));
+            }
+        }
+        // Check if debounce timer has elapsed and we should refresh
+        if let Some(debounce_until) = app.fs_debounce_until {
+            if Instant::now() >= debounce_until && !app.updating_in_progress {
+                app.fs_debounce_until = None;
+                spawn_full_refresh(&mut app);
+                needs_redraw = true;
             }
         }
 
@@ -3233,9 +3445,17 @@ fn main() -> Result<()> {
                                         }
                                     }
                                     KeyCode::Char('a') if !app.is_input_active() => {
-                                        if let Err(err) = archive_selected_session(&mut app) {
+                                        if app.viewing_archive {
+                                            if let Err(err) = unarchive_selected_session(&mut app) {
+                                                eprintln!("Failed to restore session: {}", err);
+                                            }
+                                        } else if let Err(err) = archive_selected_session(&mut app)
+                                        {
                                             eprintln!("Failed to archive session: {}", err);
                                         }
+                                    }
+                                    KeyCode::Char('A') if !app.is_input_active() => {
+                                        app.toggle_archive_view();
                                     }
                                     KeyCode::Char('d') if !app.is_input_active() => {
                                         if let Err(err) = duplicate_selected_session(&mut app) {
@@ -3269,7 +3489,7 @@ fn main() -> Result<()> {
                                             eprintln!("Failed to undo archive: {}", err);
                                         }
                                     }
-                                    KeyCode::Char('/') => {
+                                    KeyCode::Char('/') if !app.is_input_active() => {
                                         app.list_search_input = true;
                                         app.list_search_query.clear();
                                     }
@@ -3595,7 +3815,7 @@ fn main() -> Result<()> {
                                             set_view_scroll(&mut app, usize::MAX, view_h);
                                         }
                                     }
-                                    KeyCode::Char('/') => {
+                                    KeyCode::Char('/') if !app.is_input_active() => {
                                         app.search_input = true;
                                         app.search_query.clear();
                                     }
@@ -3711,7 +3931,12 @@ fn main() -> Result<()> {
                                         }
                                     }
                                     KeyCode::Char('a') if !app.is_input_active() => {
-                                        match archive_selected_session(&mut app) {
+                                        let result = if app.viewing_archive {
+                                            unarchive_selected_session(&mut app)
+                                        } else {
+                                            archive_selected_session(&mut app)
+                                        };
+                                        match result {
                                             Ok(()) => {
                                                 app.mode = Mode::List;
                                                 app.view_lines.clear();
@@ -3725,9 +3950,27 @@ fn main() -> Result<()> {
                                                 app.search_index = 0;
                                             }
                                             Err(err) => {
-                                                eprintln!("Failed to archive session: {}", err);
+                                                let action = if app.viewing_archive {
+                                                    "restore"
+                                                } else {
+                                                    "archive"
+                                                };
+                                                eprintln!("Failed to {} session: {}", action, err);
                                             }
                                         }
+                                    }
+                                    KeyCode::Char('A') if !app.is_input_active() => {
+                                        app.mode = Mode::List;
+                                        app.view_lines.clear();
+                                        app.view_text.clear();
+                                        app.view_scroll = 0;
+                                        app.view_show_tools = false;
+                                        app.view_expand_tools = false;
+                                        app.search_input = false;
+                                        app.search_query.clear();
+                                        app.search_matches.clear();
+                                        app.search_index = 0;
+                                        app.toggle_archive_view();
                                     }
                                     KeyCode::Char('u') if !app.is_input_active() => {
                                         if let Err(err) = undo_last_archive(&mut app) {
@@ -3841,7 +4084,9 @@ fn ensure_first_msgs(app: &mut App, area: Rect) {
                     if let Some(row) = app.all_rows.iter_mut().find(|r| r.id == id) {
                         row.first_msg = first.clone();
                     }
-                    app.rows[i].first_msg = first_str;
+                    app.rows[i].first_msg = first_str.clone();
+                    // Also update display_rows so the rendered view reflects the change
+                    update_display_row_first_msg(app, &id, &first_str);
                     app.first_msg_pending.remove(&id);
                     continue;
                 }
@@ -3860,6 +4105,51 @@ fn ensure_first_msgs(app: &mut App, area: Rect) {
                     app.first_msg_tx = None;
                 }
             }
+        }
+    }
+}
+
+/// Update a conversation's first_msg in display_rows, including any group headers
+/// that show this conversation as their newest preview.
+fn update_display_row_first_msg(app: &mut App, id: &str, first_msg: &str) {
+    // Find the path of this conversation so we can update group headers if needed
+    let path = app
+        .rows
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| r.path.clone());
+
+    for dr in &mut app.display_rows {
+        match dr {
+            DisplayRow::Conversation(row) if row.id == id => {
+                row.first_msg = first_msg.to_string();
+            }
+            DisplayRow::Group {
+                path: group_path,
+                newest_preview,
+                ..
+            } => {
+                // Update group preview if this conversation belongs to this group
+                // and is the newest one (has the newest_preview currently empty or
+                // matches what we're updating)
+                if let Some(ref p) = path {
+                    if group_path == p {
+                        // Check if this conversation is the newest in the group
+                        // by finding the conversation with max date_ms in this path
+                        if let Some(newest) = app
+                            .rows
+                            .iter()
+                            .filter(|r| &r.path == p)
+                            .max_by_key(|r| r.date_ms)
+                        {
+                            if newest.id == id {
+                                *newest_preview = first_msg.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
