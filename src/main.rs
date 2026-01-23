@@ -1,6 +1,6 @@
 mod chat_reader;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chat_reader::{sort_conversations_by_earliest, ChatReader, Message};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -17,11 +17,12 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use ratatui::Terminal;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -45,6 +46,54 @@ static SYNTAX_THEME: Lazy<Theme> = Lazy::new(|| {
 
 const CODE_INDENT: &str = "     ";
 const MOUSE_SCROLL_LINES: usize = 3;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🎨 Color Palette - Modern Dark Theme
+// Inspired by Nord/Dracula with a sophisticated, cohesive look
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[allow(dead_code)]
+mod theme {
+    use ratatui::style::Color;
+
+    // ─── Surface Colors ───────────────────────────────────────────────────────
+    pub const SURFACE_DIM: Color = Color::Rgb(30, 30, 46); // Dark background for modals
+    pub const SURFACE_BORDER: Color = Color::Rgb(69, 71, 90); // Subtle borders
+
+    // ─── Accent Colors ────────────────────────────────────────────────────────
+    pub const PRIMARY: Color = Color::Rgb(137, 180, 250); // Soft blue - main accent
+    pub const PRIMARY_DIM: Color = Color::Rgb(88, 91, 112); // Muted blue for borders
+    pub const SECONDARY: Color = Color::Rgb(180, 190, 254); // Lavender - headers
+
+    // ─── Semantic Colors ──────────────────────────────────────────────────────
+    pub const SUCCESS: Color = Color::Rgb(166, 227, 161); // Soft green - user messages
+    pub const SUCCESS_DIM: Color = Color::Rgb(116, 199, 136); // Darker green for accents
+    pub const INFO: Color = Color::Rgb(137, 220, 235); // Teal/cyan - assistant messages
+    pub const WARNING: Color = Color::Rgb(249, 226, 175); // Warm yellow - paths/CWD
+    pub const WARNING_BRIGHT: Color = Color::Rgb(250, 179, 135); // Peach - groups
+    pub const MUTED: Color = Color::Rgb(147, 153, 178); // Gray - tool results
+    pub const MUTED_DIM: Color = Color::Rgb(108, 112, 134); // Darker gray
+
+    // ─── Text Colors ──────────────────────────────────────────────────────────
+    pub const TEXT: Color = Color::Rgb(205, 214, 244); // Primary text
+    pub const TEXT_DIM: Color = Color::Rgb(166, 173, 200); // Secondary text
+    pub const TEXT_MUTED: Color = Color::Rgb(127, 132, 156); // Muted text
+
+    // ─── Special Colors ───────────────────────────────────────────────────────
+    pub const SELECTION_BG: Color = Color::Rgb(88, 91, 112); // Selection background
+    pub const SELECTION_FG: Color = Color::Rgb(255, 255, 255); // Selection text
+    pub const HIGHLIGHT: Color = Color::Rgb(249, 226, 175); // Search highlight bg
+    pub const HIGHLIGHT_FG: Color = Color::Rgb(30, 30, 46); // Search highlight text
+
+    // ─── Modal Accent Colors ──────────────────────────────────────────────────
+    pub const MODAL_INFO: Color = Color::Rgb(137, 220, 235); // Info modal border
+    pub const MODAL_HELP: Color = Color::Rgb(203, 166, 247); // Help modal border (mauve)
+    pub const MODAL_SETTINGS: Color = Color::Rgb(166, 227, 161); // Settings modal border
+
+    // ─── Header/Footer Gradient ───────────────────────────────────────────────
+    pub const HEADER_BG: Color = Color::Rgb(49, 50, 68); // Darker surface
+    pub const HEADER_FG: Color = Color::Rgb(205, 214, 244); // Light text
+}
 
 #[derive(Clone)]
 struct RowItem {
@@ -648,23 +697,23 @@ fn lines_for_message(
 
     let (prefix, title, header_text) = if msg.role == "user" {
         (
-            Span::styled("You  » ", Style::default().fg(Color::Green)),
-            Span::styled("You", Style::default().fg(Color::Green)),
+            Span::styled("▸ ", Style::default().fg(theme::SUCCESS)),
+            Span::styled("You", Style::default().fg(theme::SUCCESS).add_modifier(Modifier::BOLD)),
             "You:",
         )
     } else if is_tool {
         (
-            Span::styled("Tool « ", Style::default().fg(Color::Rgb(180, 180, 180))),
+            Span::styled("◂ ", Style::default().fg(theme::MUTED)),
             Span::styled(
-                "Tool Result",
-                Style::default().fg(Color::Rgb(200, 200, 200)),
+                "Tool",
+                Style::default().fg(theme::MUTED),
             ),
             "Tool Result:",
         )
     } else {
         (
-            Span::styled("AI   « ", Style::default().fg(Color::Cyan)),
-            Span::styled("Assistant", Style::default().fg(Color::Cyan)),
+            Span::styled("◂ ", Style::default().fg(theme::INFO)),
+            Span::styled("Claude", Style::default().fg(theme::INFO).add_modifier(Modifier::BOLD)),
             "Assistant:",
         )
     };
@@ -677,15 +726,15 @@ fn lines_for_message(
 
     if is_tool && !expand_tools {
         let preview = tool_preview_summary(trimmed);
-        let summary = format!("[tool result] {}  (T to expand)", preview);
+        let summary = format!("⋯ {}  (T to expand)", preview);
         out.push(Line::from(vec![
             Span::styled(
                 CODE_INDENT.to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::SURFACE_BORDER),
             ),
             Span::styled(
                 summary.clone(),
-                Style::default().fg(Color::Rgb(200, 200, 200)),
+                Style::default().fg(theme::MUTED_DIM),
             ),
         ]));
         texts.push(format!("{}{}", CODE_INDENT, summary));
@@ -734,15 +783,18 @@ fn lines_for_message(
             let mut spans = Vec::with_capacity(2);
             spans.push(Span::styled(
                 CODE_INDENT.to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::SURFACE_BORDER),
             ));
             let content_span = if is_tool {
                 Span::styled(
                     raw_line.to_string(),
-                    Style::default().fg(Color::Rgb(200, 200, 200)),
+                    Style::default().fg(theme::MUTED),
                 )
             } else {
-                Span::raw(raw_line.to_string())
+                Span::styled(
+                    raw_line.to_string(),
+                    Style::default().fg(theme::TEXT),
+                )
             };
             spans.push(content_span);
             out.push(Line::from(spans));
@@ -788,7 +840,7 @@ fn push_code_block(
         out.push(Line::from(vec![
             Span::styled(
                 CODE_INDENT.to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::SURFACE_BORDER),
             ),
             Span::raw(String::new()),
         ]));
@@ -818,7 +870,7 @@ fn highlight_code_block(
         let mut spans = Vec::new();
         spans.push(Span::styled(
             CODE_INDENT.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::SURFACE_BORDER),
         ));
 
         if monochrome {
@@ -827,7 +879,7 @@ fn highlight_code_block(
             } else {
                 spans.push(Span::styled(
                     line.to_string(),
-                    Style::default().fg(Color::Rgb(200, 200, 200)),
+                    Style::default().fg(theme::MUTED),
                 ));
             }
             result.push(Line::from(spans));
@@ -997,7 +1049,7 @@ fn map_language_alias(token: &str) -> Option<&'static str> {
 fn style_to_tui(style: SyntectStyle) -> Style {
     let fg = style.foreground;
     let fg_color = if fg.a == 0 {
-        Color::Rgb(220, 220, 220)
+        theme::TEXT
     } else {
         Color::Rgb(fg.r, fg.g, fg.b)
     };
@@ -1074,29 +1126,29 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let msg_w = width.saturating_sub(date_w + path_w + 7);
 
     let sorting_indicator = if app.sorting_in_progress {
-        " sorting…"
+        " ⏳"
     } else {
         ""
     };
     let search_indicator = if app.list_search_in_progress {
-        " searching…"
+        " ⏳"
     } else {
         ""
     };
     let watch_indicator = if app.watcher_enabled {
-        " watch:on"
+        " │ 👁 live"
     } else {
-        " watch:off"
+        ""
     };
-    let grouped_indicator = if app.grouped_mode { " grouped" } else { "" };
+    let grouped_indicator = if app.grouped_mode { " " } else { "" };
     let view_name = if app.viewing_archive {
-        "Archive"
+        "📦 Archive"
     } else {
-        "Conversations"
+        "🗂 Sessions"
     };
     let mut title_text = if let Some(fp) = &app.filter_path {
         format!(
-            " {} — {} of {} [{}{}{}{}{}] [cwd: {}] ",
+            " {} │ {} of {} │ {}{}{}{}{}│ 📁 {} ",
             view_name,
             app.rows.len(),
             app.all_rows.len(),
@@ -1109,7 +1161,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
         )
     } else {
         format!(
-            " {} — {} of {} [{}{}{}{}] ",
+            " {} │ {} of {} │ {}{}{}{}",
             view_name,
             app.rows.len(),
             app.all_rows.len(),
@@ -1120,17 +1172,17 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
         )
     };
     if app.grouped_mode && app.filter_path.is_none() {
-        title_text.push_str("[grouped] ");
+        title_text.push_str(" │ grouped ");
     }
     if !app.list_search_query.is_empty() || app.list_search_in_progress {
         if app.list_search_in_progress {
             title_text.push_str(&format!(
-                " [search: '{}'{}] ",
+                " │ 🔍 '{}'{}",
                 app.list_search_query, search_indicator
             ));
         } else {
             title_text.push_str(&format!(
-                " [search: '{}' — {} matches — x to clear] ",
+                " │ 🔍 '{}' ({} found) │ x clear ",
                 app.list_search_query,
                 app.rows.len()
             ));
@@ -1138,7 +1190,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     }
     let title = Paragraph::new(Line::from(Span::styled(
         title_text,
-        Style::default().fg(Color::White).bg(Color::Blue),
+        Style::default().fg(theme::HEADER_FG).bg(theme::HEADER_BG),
     )));
     f.render_widget(title, chunks[0]);
 
@@ -1151,7 +1203,10 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
     let header_line = Line::from(Span::styled(
         header_text,
-        Style::default().fg(Color::White).bg(Color::Blue),
+        Style::default()
+            .fg(theme::TEXT_DIM)
+            .bg(theme::HEADER_BG)
+            .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(Paragraph::new(header_line), chunks[1]);
 
@@ -1180,23 +1235,26 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
                     let cwd = format_path_cell(&path_content, path_w);
                     let msg = newest_preview;
                     let mut style = if i % 2 == 0 {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(theme::TEXT_MUTED)
                     } else {
-                        Style::default()
+                        Style::default().fg(theme::TEXT_DIM)
                     };
                     if i == app.selected {
-                        style = Style::default().fg(Color::Black).bg(Color::Cyan);
+                        style = Style::default()
+                            .fg(theme::SELECTION_FG)
+                            .bg(theme::SELECTION_BG)
+                            .add_modifier(Modifier::BOLD);
                     }
                     let cells: Vec<Cell> = vec![
                         Cell::from(pad(&date, date_w)),
-                        Cell::from("│".to_string()),
+                        Cell::from(Span::styled("│", Style::default().fg(theme::SURFACE_BORDER))),
                         Cell::from(Span::styled(
                             pad(&cwd, path_w),
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(theme::WARNING_BRIGHT)
                                 .add_modifier(Modifier::BOLD),
                         )),
-                        Cell::from("│".to_string()),
+                        Cell::from(Span::styled("│", Style::default().fg(theme::SURFACE_BORDER))),
                         Cell::from(pad(msg, msg_w)),
                     ];
                     Row::new(cells).style(style)
@@ -1213,21 +1271,24 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
                     let cwd = format_path_cell(&cwd_display, path_w);
                     let msg = &r.first_msg;
                     let mut style = if i % 2 == 0 {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(theme::TEXT_MUTED)
                     } else {
-                        Style::default()
+                        Style::default().fg(theme::TEXT_DIM)
                     };
                     if i == app.selected {
-                        style = Style::default().fg(Color::Black).bg(Color::Cyan);
+                        style = Style::default()
+                            .fg(theme::SELECTION_FG)
+                            .bg(theme::SELECTION_BG)
+                            .add_modifier(Modifier::BOLD);
                     }
                     let cells: Vec<Cell> = vec![
                         Cell::from(pad(&date, date_w)),
-                        Cell::from("│".to_string()),
+                        Cell::from(Span::styled("│", Style::default().fg(theme::SURFACE_BORDER))),
                         Cell::from(Span::styled(
                             pad(&cwd, path_w),
-                            Style::default().fg(Color::Green),
+                            Style::default().fg(theme::WARNING),
                         )),
-                        Cell::from("│".to_string()),
+                        Cell::from(Span::styled("│", Style::default().fg(theme::SURFACE_BORDER))),
                         Cell::from(pad(msg, msg_w)),
                     ];
                     Row::new(cells).style(style)
@@ -1246,7 +1307,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let table = Table::new(rows, widths).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
+            .border_style(Style::default().fg(theme::PRIMARY_DIM)),
     );
     f.render_widget(table, chunks[2]);
 
@@ -1256,19 +1317,19 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
         "a archive"
     };
     let footer_text = if app.list_search_input {
-        format!("/{}  — Enter run  Esc cancel", app.list_search_query)
+        format!(" /{}  — Enter run  Esc cancel", app.list_search_query)
     } else if app.rename_input {
-        format!("Rename: {}_  — Enter save  Esc cancel", app.rename_query)
+        format!(" Rename: {}_  — Enter save  Esc cancel", app.rename_query)
     } else if app.repath_input {
-        format!("Path: {}_  — Enter save  Esc cancel", app.repath_query)
+        format!(" Path: {}_  — Enter save  Esc cancel", app.repath_query)
     } else if app.grouped_mode {
-        format!(" ↑/↓ move   Enter expand/open   ←/→ collapse/expand   Tab flat view   / search   s sort   o order   e export   {}   A toggle archive   q quit ", archive_action)
+        format!(" ↑↓ move  Enter expand/open  ←→ collapse/expand  Tab flat  / search  s sort  e export  {}  A archive  ? help  q quit ", archive_action)
     } else {
-        format!(" ↑/↓ move   Enter open   Tab grouped   f filter cwd   / search   s sort key   o order   e export   n rename   {}   A toggle archive   q quit ", archive_action)
+        format!(" ↑↓ move  Enter open  Tab grouped  f filter  / search  s sort  e export  n rename  {}  A archive  ? help  q quit ", archive_action)
     };
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
-        Style::default().fg(Color::White).bg(Color::Blue),
+        Style::default().fg(theme::TEXT_DIM).bg(theme::HEADER_BG),
     )));
     f.render_widget(footer, chunks[3]);
 }
@@ -1277,8 +1338,8 @@ fn render_view(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let chunks = view_layout(area);
 
     let header = Paragraph::new(Line::from(Span::styled(
-        " Chat ",
-        Style::default().fg(Color::White).bg(Color::Blue),
+        " 💬 Conversation ",
+        Style::default().fg(theme::HEADER_FG).bg(theme::HEADER_BG),
     )));
     f.render_widget(header, chunks[0]);
 
@@ -1294,7 +1355,7 @@ fn render_view(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
+                .border_style(Style::default().fg(theme::PRIMARY_DIM)),
         )
         .wrap(Wrap { trim: false })
         .scroll((app.view_scroll, 0));
@@ -1306,18 +1367,18 @@ fn render_view(f: &mut ratatui::Frame, area: Rect, app: &App) {
         "a archive"
     };
     let footer_text = if app.search_input {
-        format!("/{}", app.search_query)
+        format!(" /{}", app.search_query)
     } else if app.repath_input {
-        format!("Path: {}_  — Enter save  Esc cancel", app.repath_query)
+        format!(" Path: {}_  — Enter save  Esc cancel", app.repath_query)
     } else if !app.search_query.is_empty() {
         if app.search_matches.is_empty() {
             format!(
-                " 0/0 — / to search — t toggle tools — T expand/collapse — {} ",
+                " 0/0 — / search — t tools — T expand — {} ",
                 archive_action
             )
         } else {
             format!(
-                " {}/{} — n/N next/prev — / new search — t toggle tools — T expand/collapse — {} ",
+                " {}/{} — n/N next/prev — / search — t tools — T expand — {} ",
                 app.search_index + 1,
                 app.search_matches.len(),
                 archive_action
@@ -1325,13 +1386,13 @@ fn render_view(f: &mut ratatui::Frame, area: Rect, app: &App) {
         }
     } else {
         format!(
-            " ↑/↓ scroll   PgUp/PgDn page   Home/g top   End/G bottom   / search   t toggle tools   T expand/collapse   Esc/q back   i info   r resume   e export   {}   u undo   p repath ",
+            " ↑↓ scroll  PgUp/Dn page  g/G top/bottom  / search  t tools  T expand  r resume  e export  {}  ? help  q back ",
             archive_action
         )
     };
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
-        Style::default().fg(Color::White).bg(Color::Blue),
+        Style::default().fg(theme::TEXT_DIM).bg(theme::HEADER_BG),
     )));
     f.render_widget(footer, chunks[2]);
 }
@@ -2052,9 +2113,9 @@ fn highlight_current_line(lines: &[Line<'static>], idx: usize) -> Vec<Line<'stat
             let mut new_spans: Vec<Span> = Vec::with_capacity(ln.spans.len());
             for sp in ln.spans.iter() {
                 let mut st = sp.style;
-                st.bg = Some(Color::Yellow);
-                // Force black text for readability regardless of original
-                st.fg = Some(Color::Black);
+                st.bg = Some(theme::HIGHLIGHT);
+                // Force dark text for readability regardless of original
+                st.fg = Some(theme::HIGHLIGHT_FG);
                 new_spans.push(Span {
                     content: sp.content.clone(),
                     style: st,
@@ -2647,12 +2708,12 @@ fn render_info_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let modal = Paragraph::new(info_text)
         .block(
             Block::default()
-                .title(" Session Info ")
+                .title(" ℹ Session Info ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(theme::MODAL_INFO)),
         )
         .wrap(Wrap { trim: true })
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+        .style(Style::default().bg(theme::SURFACE_DIM).fg(theme::TEXT));
 
     f.render_widget(modal, popup_area);
 }
@@ -2682,31 +2743,36 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     let list_section_style = if app.mode == Mode::List {
         Style::default()
-            .fg(Color::Green)
+            .fg(theme::SUCCESS)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme::TEXT_DIM)
             .add_modifier(Modifier::BOLD)
     };
 
     let view_section_style = if app.mode == Mode::View {
         Style::default()
-            .fg(Color::Green)
+            .fg(theme::SUCCESS)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme::TEXT_DIM)
             .add_modifier(Modifier::BOLD)
     };
 
     let mut lines: Vec<Line> = Vec::new();
-    let shortcut_line = |key: &str, desc: &str| Line::from(format!("{:<20}{}", key, desc));
+    let shortcut_line = |key: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(format!("{:<16}", key), Style::default().fg(theme::PRIMARY)),
+            Span::styled(desc.to_string(), Style::default().fg(theme::TEXT_DIM)),
+        ])
+    };
 
     lines.push(Line::from(Span::styled(
-        "General",
+        "⌨ General",
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme::WARNING)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(shortcut_line("?", "Show this list of shortcuts"));
@@ -2716,13 +2782,12 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line(",", "Open settings modal"));
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("List Mode", list_section_style)));
+    lines.push(Line::from(Span::styled("📋 List Mode", list_section_style)));
     lines.push(shortcut_line("q", "Quit application"));
     lines.push(shortcut_line("Enter", "Open session / submit list search"));
-    lines.push(shortcut_line("Up/Down", "Move selection"));
-    lines.push(shortcut_line("PageUp/PageDown", "Page through sessions"));
-    lines.push(shortcut_line("Home or g", "Jump to first session"));
-    lines.push(shortcut_line("End or G", "Jump to last session"));
+    lines.push(shortcut_line("↑/↓", "Move selection"));
+    lines.push(shortcut_line("PgUp/PgDn", "Page through sessions"));
+    lines.push(shortcut_line("g / G", "Jump to first / last session"));
     lines.push(shortcut_line("/", "Start typing to search sessions"));
     lines.push(shortcut_line("s", "Cycle sort key"));
     lines.push(shortcut_line("o", "Toggle sort order"));
@@ -2739,12 +2804,11 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line("e", "Export session to HTML"));
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("View Mode", view_section_style)));
-    lines.push(shortcut_line("q or Esc", "Return to session list"));
-    lines.push(shortcut_line("Up/Down", "Scroll conversation"));
-    lines.push(shortcut_line("PageUp/PageDown", "Page conversation"));
-    lines.push(shortcut_line("Home or g", "Jump to top of conversation"));
-    lines.push(shortcut_line("End or G", "Jump to bottom of conversation"));
+    lines.push(Line::from(Span::styled("💬 View Mode", view_section_style)));
+    lines.push(shortcut_line("q / Esc", "Return to session list"));
+    lines.push(shortcut_line("↑/↓", "Scroll conversation"));
+    lines.push(shortcut_line("PgUp/PgDn", "Page conversation"));
+    lines.push(shortcut_line("g / G", "Jump to top / bottom"));
     lines.push(shortcut_line("/", "Search within conversation"));
     lines.push(shortcut_line("Enter", "Jump to first search match"));
     lines.push(shortcut_line("n / N", "Next / previous match"));
@@ -2758,17 +2822,20 @@ fn render_help_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(shortcut_line("e", "Export session to HTML"));
 
     lines.push(Line::from(""));
-    lines.push(Line::from("Press ? again or Esc to close."));
+    lines.push(Line::from(Span::styled(
+        "Press ? or Esc to close",
+        Style::default().fg(theme::TEXT_MUTED),
+    )));
 
     let modal = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" Shortcuts ")
+                .title(" ⌨ Keyboard Shortcuts ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
+                .border_style(Style::default().fg(theme::MODAL_HELP)),
         )
         .wrap(Wrap { trim: true })
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+        .style(Style::default().bg(theme::SURFACE_DIM).fg(theme::TEXT));
 
     f.render_widget(modal, popup_area);
 }
@@ -2786,11 +2853,17 @@ fn render_settings_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(Clear, popup_area);
 
     // Create lines for the settings
-    let mut lines = vec![Line::from("Settings"), Line::from("")];
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Configuration",
+            Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
 
     // Claude Command field
     let claude_indicator = if app.settings_selected_field == 0 {
-        " >"
+        "▸ "
     } else {
         "  "
     };
@@ -2808,9 +2881,9 @@ fn render_settings_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(Line::from(Span::styled(
         claude_field,
         if app.settings_selected_field == 0 {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme::PRIMARY)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme::TEXT_DIM)
         },
     )));
 
@@ -2818,7 +2891,7 @@ fn render_settings_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     // Quit after launch field
     let quit_indicator = if app.settings_selected_field == 1 {
-        " >"
+        "▸ "
     } else {
         "  "
     };
@@ -2835,24 +2908,27 @@ fn render_settings_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
     lines.push(Line::from(Span::styled(
         quit_field,
         if app.settings_selected_field == 1 {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme::PRIMARY)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme::TEXT_DIM)
         },
     )));
 
     lines.push(Line::from(""));
-    lines.push(Line::from("↑/↓ navigate  Enter save  Esc cancel"));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ navigate  Enter save  Esc cancel",
+        Style::default().fg(theme::TEXT_MUTED),
+    )));
 
     let modal = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" Settings ")
+                .title(" ⚙ Settings ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(theme::MODAL_SETTINGS)),
         )
         .wrap(Wrap { trim: true })
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+        .style(Style::default().bg(theme::SURFACE_DIM).fg(theme::TEXT));
 
     f.render_widget(modal, popup_area);
 }
@@ -2989,6 +3065,171 @@ end"#,
     }
 }
 
+fn setup_demo_data() -> Result<(TempDir, PathBuf)> {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("cc-history-demo-")
+        .tempdir()
+        .context("Failed to create temp directory for demo data")?;
+    
+    let projects_dir = temp_dir.path().join("projects");
+    fs::create_dir_all(&projects_dir)?;
+    
+    let now = chrono::Utc::now().timestamp_millis();
+    
+    // Define demo conversations with real tech references and humor
+    let conversations: Vec<(&str, &str, i64, &str, Option<&str>)> = vec![
+        // Web/React conversations
+        ("-Users-demo-react-app", "a1b2c3d4-e5f6-7890-abcd-ef1234567890", now - 3600000, "/Users/demo/react-app", Some("Created a TypeScript React Button component")),
+        ("-Users-demo-react-app", "b2c3d4e5-f6a7-8901-bcde-f23456789012", now - 7200000, "/Users/demo/react-app", Some("Fixed useState hook infinite loop")),
+        ("-Users-demo-nextjs-site", "c3d4e5f6-a7b8-9012-cdef-345678901234", now - 10800000, "/Users/demo/nextjs-site", Some("Set up Next.js 14 app router with server components")),
+        ("-Users-demo-nextjs-site", "d4e5f6a7-b8c9-0123-def4-456789012345", now - 14400000, "/Users/demo/nextjs-site", Some("Debugged hydration mismatch in Next.js")),
+        ("-Users-demo-vue-app", "e5f6a7b8-c9d0-1234-ef56-789012345678", now - 18000000, "/Users/demo/vue-app", Some("Migrated from Vue 2 to Vue 3 Composition API")),
+        ("-Users-demo-svelte-kit", "f6a7b8c9-d0e1-2345-f678-901234567890", now - 21600000, "/Users/demo/svelte-kit", Some("Built SvelteKit form with validation")),
+        
+        // Rust conversations
+        ("-Users-demo-rust-cli", "a7b8c9d0-e1f2-3456-789a-bcdef0123456", now - 86400000 * 2, "/Users/demo/rust-cli", Some("Improved error handling in Rust code using Result types")),
+        ("-Users-demo-rust-cli", "b8c9d0e1-f2a3-4567-89ab-cdef01234567", now - 86400000 * 2 - 3600000, "/Users/demo/rust-cli", Some("Added clap for CLI argument parsing")),
+        ("-Users-demo-tokio-async", "c9d0e1f2-a3b4-5678-9abc-def012345678", now - 86400000 * 3, "/Users/demo/tokio-async", Some("Implemented async HTTP server with tokio")),
+        ("-Users-demo-tokio-async", "d0e1f2a3-b4c5-6789-abcd-ef0123456789", now - 86400000 * 3 - 7200000, "/Users/demo/tokio-async", Some("Fixed deadlock in tokio spawn_blocking")),
+        ("-Users-demo-serde-json", "e1f2a3b4-c5d6-789a-bcde-f01234567890", now - 86400000 * 4, "/Users/demo/serde-json", Some("Parsed JSON with serde and custom deserializer")),
+        
+        // Python conversations
+        ("-Users-demo-fastapi-backend", "f2a3b4c5-d6e7-89ab-cdef-012345678901", now - 86400000, "/Users/demo/fastapi-backend", Some("Created FastAPI endpoint with Pydantic validation")),
+        ("-Users-demo-fastapi-backend", "a3b4c5d6-e7f8-9abc-def0-123456789012", now - 86400000 - 1800000, "/Users/demo/fastapi-backend", Some("Added async database queries with SQLAlchemy")),
+        ("-Users-demo-pandas-analysis", "b4c5d6e7-f8a9-bcde-f012-345678901234", now - 86400000 * 3, "/Users/demo/pandas-analysis", Some("Processed CSV data using pandas for filtering and aggregation")),
+        ("-Users-demo-pandas-analysis", "c5d6e7f8-a9b0-cdef-0123-456789012345", now - 86400000 * 3 - 3600000, "/Users/demo/pandas-analysis", Some("Created pivot table and groupby aggregations")),
+        ("-Users-demo-django-cms", "d6e7f8a9-b0c1-def0-1234-567890123456", now - 86400000 * 5, "/Users/demo/django-cms", Some("Built Django admin interface for content management")),
+        ("-Users-demo-django-cms", "e7f8a9b0-c1d2-ef01-2345-678901234567", now - 86400000 * 5 - 7200000, "/Users/demo/django-cms", Some("Fixed N+1 query problem with select_related")),
+        
+        // JavaScript/Node conversations
+        ("-Users-demo-node-api", "f8a9b0c1-d2e3-f012-3456-789012345678", now - 86400000 * 2, "/Users/demo/node-api", Some("Implemented API data fetching with comprehensive error handling")),
+        ("-Users-demo-node-api", "a9b0c1d2-e3f4-0123-4567-890123456789", now - 86400000 * 2 - 5400000, "/Users/demo/node-api", Some("Added Express middleware for request logging")),
+        ("-Users-demo-webpack-config", "b0c1d2e3-f4a5-1234-5678-901234567890", now - 86400000 * 6, "/Users/demo/webpack-config", Some("Configured webpack 5 with code splitting")),
+        ("-Users-demo-webpack-config", "c1d2e3f4-a5b6-2345-6789-012345678901", now - 86400000 * 6 - 10800000, "/Users/demo/webpack-config", Some("Fixed 'Module not found' errors in webpack build")),
+        ("-Users-demo-typescript-lib", "d2e3f4a5-b6c7-3456-7890-123456789012", now - 86400000 * 4, "/Users/demo/typescript-lib", Some("Created TypeScript library with proper type exports")),
+        
+        // Go conversations
+        ("-Users-demo-go-microservice", "e3f4a5b6-c7d8-4567-8901-234567890123", now - 86400000 * 7, "/Users/demo/go-microservice", Some("Built Go microservice with gin router")),
+        ("-Users-demo-go-microservice", "f4a5b6c7-d8e9-5678-9012-345678901234", now - 86400000 * 7 - 14400000, "/Users/demo/go-microservice", Some("Implemented graceful shutdown with context cancellation")),
+        ("-Users-demo-goroutines", "a5b6c7d8-e9f0-6789-0123-456789012345", now - 86400000 * 8, "/Users/demo/goroutines", Some("Fixed race condition in goroutine pool")),
+        
+        // Database/SQL conversations
+        ("-Users-demo-postgres-optimization", "b6c7d8e9-f0a1-7890-1234-567890123456", now - 86400000 * 5, "/Users/demo/postgres-optimization", Some("Optimized SQL queries with indexing strategies")),
+        ("-Users-demo-postgres-optimization", "c7d8e9f0-a1b2-8901-2345-678901234567", now - 86400000 * 5 - 1800000, "/Users/demo/postgres-optimization", Some("Added EXPLAIN ANALYZE to slow query investigation")),
+        ("-Users-demo-redis-cache", "d8e9f0a1-b2c3-9012-3456-789012345678", now - 86400000 * 4, "/Users/demo/redis-cache", Some("Implemented Redis caching layer for API responses")),
+        ("-Users-demo-mongodb-aggregation", "e9f0a1b2-c3d4-0123-4567-890123456789", now - 86400000 * 6, "/Users/demo/mongodb-aggregation", Some("Created MongoDB aggregation pipeline for analytics")),
+        
+        // DevOps/Infrastructure
+        ("-Users-demo-docker-compose", "f0a1b2c3-d4e5-1234-5678-901234567890", now - 86400000 * 9, "/Users/demo/docker-compose", Some("Set up docker-compose with postgres and redis services")),
+        ("-Users-demo-k8s-deployment", "a1b2c3d4-e5f6-2345-6789-012345678901", now - 86400000 * 10, "/Users/demo/k8s-deployment", Some("Created Kubernetes deployment YAML with health checks")),
+        ("-Users-demo-ci-cd-github", "b2c3d4e5-f6a7-3456-7890-123456789012", now - 86400000 * 11, "/Users/demo/ci-cd-github", Some("Configured GitHub Actions workflow for CI/CD")),
+        ("-Users-demo-terraform-aws", "c3d4e5f6-a7b8-4567-8901-234567890123", now - 86400000 * 12, "/Users/demo/terraform-aws", Some("Provisioned AWS infrastructure with Terraform")),
+        
+        // Mobile
+        ("-Users-demo-react-native", "d4e5f6a7-b8c9-5678-9012-345678901234", now - 86400000 * 13, "/Users/demo/react-native", Some("Built React Native navigation with React Navigation")),
+        ("-Users-demo-swiftui-app", "e5f6a7b8-c9d0-6789-0123-456789012345", now - 86400000 * 14, "/Users/demo/swiftui-app", Some("Created SwiftUI view with Combine for state management")),
+        ("-Users-demo-kotlin-android", "f6a7b8c9-d0e1-7890-1234-567890123456", now - 86400000 * 15, "/Users/demo/kotlin-android", Some("Implemented RecyclerView adapter with DiffUtil")),
+        
+        // Testing
+        ("-Users-demo-jest-tests", "a7b8c9d0-e1f2-8901-2345-678901234567", now - 86400000 * 16, "/Users/demo/jest-tests", Some("Wrote Jest unit tests with mocking")),
+        ("-Users-demo-pytest-fixtures", "b8c9d0e1-f2a3-9012-3456-789012345678", now - 86400000 * 17, "/Users/demo/pytest-fixtures", Some("Created pytest fixtures for database testing")),
+        ("-Users-demo-rust-tests", "c9d0e1f2-a3b4-0123-4567-890123456789", now - 86400000 * 18, "/Users/demo/rust-tests", Some("Added property-based tests with proptest")),
+        
+        // More diverse topics
+        ("-Users-demo-graphql-api", "d0e1f2a3-b4c5-1234-5678-901234567890", now - 86400000 * 19, "/Users/demo/graphql-api", Some("Built GraphQL API with Apollo Server")),
+        ("-Users-demo-websocket-chat", "e1f2a3b4-c5d6-2345-6789-012345678901", now - 86400000 * 20, "/Users/demo/websocket-chat", Some("Implemented WebSocket chat with Socket.io")),
+        ("-Users-demo-elasticsearch", "f2a3b4c5-d6e7-3456-7890-123456789012", now - 86400000 * 21, "/Users/demo/elasticsearch", Some("Set up Elasticsearch indexing with proper mappings")),
+        ("-Users-demo-rabbitmq-worker", "a3b4c5d6-e7f8-4567-8901-234567890123", now - 86400000 * 22, "/Users/demo/rabbitmq-worker", Some("Created RabbitMQ worker with retry logic")),
+        ("-Users-demo-prometheus-metrics", "b4c5d6e7-f8a9-5678-9012-345678901234", now - 86400000 * 23, "/Users/demo/prometheus-metrics", Some("Added Prometheus metrics to Go service")),
+        ("-Users-demo-grafana-dashboard", "c5d6e7f8-a9b0-6789-0123-456789012345", now - 86400000 * 24, "/Users/demo/grafana-dashboard", Some("Created Grafana dashboard for monitoring")),
+        ("-Users-demo-nginx-config", "d6e7f8a9-b0c1-7890-1234-567890123456", now - 86400000 * 25, "/Users/demo/nginx-config", Some("Configured nginx reverse proxy with SSL")),
+        ("-Users-demo-certbot-ssl", "e7f8a9b0-c1d2-8901-2345-678901234567", now - 86400000 * 26, "/Users/demo/certbot-ssl", Some("Set up Let's Encrypt SSL with certbot")),
+        ("-Users-demo-git-hooks", "f8a9b0c1-d2e3-9012-3456-789012345678", now - 86400000 * 27, "/Users/demo/git-hooks", Some("Created pre-commit hooks with husky")),
+        ("-Users-demo-eslint-config", "a9b0c1d2-e3f4-0123-4567-890123456789", now - 86400000 * 28, "/Users/demo/eslint-config", Some("Configured ESLint with TypeScript rules")),
+        ("-Users-demo-prettier-format", "b0c1d2e3-f4a5-1234-5678-901234567890", now - 86400000 * 29, "/Users/demo/prettier-format", Some("Set up Prettier for code formatting")),
+    ];
+    
+    // Generate conversations
+    for (proj_dir, id, timestamp, cwd, summary) in conversations {
+        let proj_path = projects_dir.join(proj_dir);
+        fs::create_dir_all(&proj_path)?;
+        let file_path = proj_path.join(format!("{}.jsonl", id));
+        let mut file = fs::File::create(&file_path)?;
+        
+        // Generate humorous user messages based on project type
+        let (user_msg, assistant_msg) = match proj_dir {
+            s if s.contains("react") => (
+                "Why is my React component re-rendering 47 times?",
+                "Ah, the classic 'infinite re-render' problem! You're probably updating state in render. Here's the fix:\n\n```tsx\n// ❌ Don't do this\nfunction Component() {\n  const [count, setCount] = useState(0);\n  setCount(count + 1); // This causes infinite loop!\n  return <div>{count}</div>;\n}\n\n// ✅ Do this instead\nfunction Component() {\n  const [count, setCount] = useState(0);\n  useEffect(() => {\n    setCount(prev => prev + 1);\n  }, []); // Only run once\n  return <div>{count}</div>;\n}\n```"
+            ),
+            s if s.contains("nextjs") => (
+                "My Next.js page is showing 'use client' errors everywhere",
+                "The 'use client' directive is required when using hooks or browser APIs. Make sure you have it at the top:\n\n```tsx\n'use client';\n\nimport { useState } from 'react';\n\nexport default function Page() {\n  const [state, setState] = useState(0);\n  return <div>{state}</div>;\n}\n```\n\nServer components can't use hooks - that's the trade-off for server-side rendering!"
+            ),
+            s if s.contains("rust") => (
+                "The borrow checker is being mean to me again",
+                "The borrow checker is just trying to prevent memory safety bugs! Here's a common pattern:\n\n```rust\n// ❌ This won't compile\nlet mut vec = vec![1, 2, 3];\nlet first = &vec[0];\nvec.push(4); // Error: cannot borrow as mutable\n\n// ✅ Do this instead\nlet mut vec = vec![1, 2, 3];\nlet first = vec[0]; // Copy the value\nvec.push(4); // Now this works!\n```\n\nRemember: Rust's ownership system prevents data races at compile time!"
+            ),
+            s if s.contains("tokio") => (
+                "My tokio tasks are spawning but never completing",
+                "Check your `.await` calls! Tokio tasks run concurrently, but you need to await them:\n\n```rust\n// ❌ This spawns but doesn't wait\ntokio::spawn(async {\n    do_work().await;\n});\n\n// ✅ Store the handle and await it\nlet handle = tokio::spawn(async {\n    do_work().await;\n});\nhandle.await?;\n```"
+            ),
+            s if s.contains("fastapi") => (
+                "FastAPI is returning 422 validation errors",
+                "Pydantic is strict about types! Make sure your request body matches your model:\n\n```python\nfrom pydantic import BaseModel\n\nclass User(BaseModel):\n    name: str\n    age: int\n\n@app.post(\"/users\")\nasync def create_user(user: User):\n    return user\n```\n\nSend `{\"name\": \"Alice\", \"age\": 30}` not `{\"name\": \"Alice\", \"age\": \"30\"}` - age must be an int!"
+            ),
+            s if s.contains("pandas") => (
+                "Pandas is giving me SettingWithCopyWarning again",
+                "The classic pandas gotcha! Use `.copy()` or `.loc`:\n\n```python\n# ❌ This triggers warning\ndf[df['age'] > 18]['name'] = 'Adult'\n\n# ✅ Do this instead\ndf.loc[df['age'] > 18, 'name'] = 'Adult'\n# or\ndf_filtered = df[df['age'] > 18].copy()\ndf_filtered['name'] = 'Adult'\n```"
+            ),
+            s if s.contains("docker") => (
+                "Docker build is taking forever",
+                "Optimize your Dockerfile with multi-stage builds and layer caching:\n\n```dockerfile\n# Use specific tags, not 'latest'\nFROM node:20-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci --only=production\nCOPY . .\nRUN npm run build\n\nFROM node:20-alpine\nWORKDIR /app\nCOPY --from=builder /app/dist ./dist\nCOPY --from=builder /app/node_modules ./node_modules\nCMD [\"node\", \"dist/index.js\"]\n```\n\nLayer caching means unchanged dependencies won't rebuild!"
+            ),
+            s if s.contains("k8s") => (
+                "My Kubernetes pod keeps crashing",
+                "Check your resource limits and health checks:\n\n```yaml\nresources:\n  requests:\n    memory: \"128Mi\"\n    cpu: \"100m\"\n  limits:\n    memory: \"256Mi\"\n    cpu: \"200m\"\nlivenessProbe:\n  httpGet:\n    path: /health\n    port: 8080\n  initialDelaySeconds: 30\n```\n\nOOMKilled means you need more memory limits!"
+            ),
+            s if s.contains("webpack") => (
+                "Webpack bundle size is 5MB, help!",
+                "Use code splitting and analyze your bundle:\n\n```js\n// Dynamic imports for code splitting\nconst Component = lazy(() => import('./Component'));\n\n// Analyze bundle\nnpm install --save-dev webpack-bundle-analyzer\n```\n\nCheck what's actually in that bundle - you might be importing entire libraries!"
+            ),
+            s if s.contains("postgres") => (
+                "My SQL query takes 30 seconds",
+                "Add indexes and use EXPLAIN ANALYZE:\n\n```sql\n-- See what's slow\nEXPLAIN ANALYZE SELECT * FROM users WHERE email = 'test@example.com';\n\n-- Add index\nCREATE INDEX idx_users_email ON users(email);\n\n-- Avoid SELECT *\nSELECT id, name FROM users WHERE email = 'test@example.com';\n```"
+            ),
+            s if s.contains("redis") => (
+                "Redis cache isn't working",
+                "Check TTL and serialization:\n\n```python\nimport redis\nimport json\n\nr = redis.Redis()\n# Set with expiration\nr.setex('key', 3600, json.dumps(data))\n# Get\ncached = json.loads(r.get('key'))\n```\n\nMake sure you're setting TTLs or your cache will grow forever!"
+            ),
+            s if s.contains("graphql") => (
+                "GraphQL N+1 query problem",
+                "Use DataLoader to batch queries:\n\n```js\nconst DataLoader = require('dataloader');\nconst userLoader = new DataLoader(async (ids) => {\n  const users = await db.users.findByIds(ids);\n  return ids.map(id => users.find(u => u.id === id));\n});\n```\n\nThis batches multiple user fetches into one query!"
+            ),
+            s if s.contains("websocket") => (
+                "WebSocket keeps disconnecting",
+                "Add reconnection logic and heartbeat:\n\n```js\nconst ws = new WebSocket('ws://localhost:8080');\nws.onclose = () => {\n  setTimeout(() => {\n    // Reconnect\n    connectWebSocket();\n  }, 1000);\n};\n\n// Heartbeat\nsetInterval(() => ws.send('ping'), 30000);\n```"
+            ),
+            s if s.contains("eslint") => (
+                "ESLint is complaining about everything",
+                "Configure it properly in `.eslintrc.js`:\n\n```js\nmodule.exports = {\n  extends: ['eslint:recommended', 'plugin:@typescript-eslint/recommended'],\n  rules: {\n    '@typescript-eslint/no-explicit-any': 'warn',\n    'no-console': 'off', // Or 'warn' for production\n  },\n};\n```\n\nYou can disable specific rules per line with `// eslint-disable-next-line`"
+            ),
+            _ => (
+                "How do I fix this bug?",
+                "Let me help you debug this. Can you share the error message and stack trace?"
+            ),
+        };
+        
+        writeln!(file, r#"{{"type":"user","message":{{"role":"user","content":"{}"}},"timestamp":{},"cwd":"{}"}}"#, user_msg, timestamp, cwd)?;
+        writeln!(file, r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{}"}}]}},"timestamp":{}}}"#, assistant_msg, timestamp + 2000)?;
+        if let Some(s) = summary {
+            writeln!(file, r#"{{"type":"summary","summary":"{}"}}"#, s)?;
+        }
+    }
+    
+    Ok((temp_dir, projects_dir))
+}
+
 fn main() -> Result<()> {
     // Optional override for projects directory
     let args: Vec<String> = std::env::args().collect();
@@ -3005,10 +3246,21 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut projects_override: Option<PathBuf> = None;
+    // Handle --demo flag: create demo data in temp directory
+    let (_demo_temp_dir, demo_projects_override): (Option<TempDir>, Option<PathBuf>) = 
+        if args.iter().any(|a| a == "--demo") {
+            let (temp_dir, demo_path) = setup_demo_data()?;
+            // Store temp_dir to keep it alive for the duration of the program
+            (Some(temp_dir), Some(demo_path))
+        } else {
+            (None, None)
+        };
+
+    let mut projects_override: Option<PathBuf> = demo_projects_override;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--projects-dir" && i + 1 < args.len() {
+            // --projects-dir can override --demo if explicitly provided
             projects_override = Some(PathBuf::from(args[i + 1].clone()));
             i += 1;
         }
