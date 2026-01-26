@@ -1,4 +1,3 @@
-use anyhow::{anyhow, Context, Result};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::Value;
@@ -9,13 +8,15 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::error::{HistoryError, Result};
+
 static HOME_DIR: Lazy<Option<PathBuf>> = Lazy::new(dirs::home_dir);
 
 #[derive(Debug, Clone)]
 pub struct ConversationMeta {
     pub id: String,
     pub path: Option<String>,
-    pub created_at: Option<i64>, // ms epoch
+    pub created_at: Option<i64>,
     pub file: PathBuf,
     pub summary: Option<String>,
 }
@@ -57,7 +58,6 @@ fn extract_text(val: &Value) -> Option<String> {
         return Some(s.to_string());
     }
 
-    // Object case: support either direct text/content or nested content array
     if let Some(obj) = val.as_object() {
         if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
             return Some(s.to_string());
@@ -73,7 +73,6 @@ fn extract_text(val: &Value) -> Option<String> {
                         return Some(s.to_string());
                     }
                     if let Some(o) = p.as_object() {
-                        // Skip tool_use/tool_result blocks for plaintext extraction
                         if let Some(t) = o.get("type").and_then(|v| v.as_str()) {
                             if t == "tool_use" || t == "tool_result" {
                                 return None;
@@ -95,7 +94,6 @@ fn extract_text(val: &Value) -> Option<String> {
         }
     }
 
-    // Top-level array case
     if let Some(arr) = val.as_array() {
         let parts: Vec<String> = arr
             .iter()
@@ -216,6 +214,10 @@ impl ChatReader {
         Self { projects_root: dir }
     }
 
+    pub fn projects_dir(&self) -> &Path {
+        &self.projects_root
+    }
+
     pub fn list_conversations(&self) -> Result<Vec<ConversationMeta>> {
         let projects = self.projects_root.clone();
         if !projects.exists() {
@@ -240,14 +242,13 @@ impl ChatReader {
                 if id.starts_with("agent-") {
                     continue;
                 }
-                // read lines until we find summary and conversation metadata
                 let (summary, cwd, created_at) = if let Ok(file) = File::open(path) {
                     let reader = BufReader::new(file);
                     let mut summary: Option<String> = None;
                     let mut cwd = None;
                     let mut created_at = None;
 
-                    for line_str in reader.lines().map_while(Result::ok) {
+                    for line_str in reader.lines().map_while(std::result::Result::ok) {
                         if let Ok(v) = serde_json::from_str::<Value>(&line_str) {
                             if summary.is_none()
                                 && v.get("type").and_then(|x| x.as_str()) == Some("summary")
@@ -306,7 +307,7 @@ impl ChatReader {
                 break;
             }
         }
-        let file = found.ok_or_else(|| anyhow!("Conversation not found: {}", id))?;
+        let file = found.ok_or_else(|| HistoryError::SessionNotFound(PathBuf::from(id)))?;
         Self::parse_conversation_file(&file)
     }
 
@@ -317,13 +318,13 @@ impl ChatReader {
         Self::parse_conversation_file(path.as_ref())
     }
 
-    fn parse_conversation_file(path: &Path) -> Result<(ConversationMeta, Vec<Message>)> {
+    pub fn parse_conversation_file(path: &Path) -> Result<(ConversationMeta, Vec<Message>)> {
         let id = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("Invalid conversation file: {}", path.display()))?
+            .ok_or_else(|| HistoryError::InvalidPath(path.to_path_buf()))?
             .to_string();
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let f = File::open(path)?;
         let mut msgs = Vec::new();
         let mut summary: Option<String> = None;
         let mut meta_cwd: Option<String> = None;
@@ -662,10 +663,9 @@ impl ChatReader {
     pub fn earliest_message_time_ms<P: AsRef<Path>>(file: P) -> Option<i64> {
         let f = File::open(file).ok()?;
         let mut best: Option<i64> = None;
-        for line in BufReader::new(f).lines().map_while(Result::ok) {
+        for line in BufReader::new(f).lines().map_while(std::result::Result::ok) {
             let v: Value = serde_json::from_str(&line).ok()?;
             let m = v.get("message").cloned().unwrap_or(v);
-            // Try multiple timestamp fields
             let t = [
                 "createdAt",
                 "created_at",
@@ -693,7 +693,7 @@ impl ChatReader {
     pub fn latest_message_time_ms<P: AsRef<Path>>(file: P) -> Option<i64> {
         let f = File::open(file).ok()?;
         let mut best: Option<i64> = None;
-        for line in BufReader::new(f).lines().map_while(Result::ok) {
+        for line in BufReader::new(f).lines().map_while(std::result::Result::ok) {
             let v: Value = serde_json::from_str(&line).ok()?;
             let m = v.get("message").cloned().unwrap_or(v);
             let t = [
@@ -717,6 +717,12 @@ impl ChatReader {
             }
         }
         best
+    }
+}
+
+impl Default for ChatReader {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

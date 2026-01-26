@@ -1,7 +1,9 @@
-mod chat_reader;
-
 use anyhow::{anyhow, Context, Result};
-use chat_reader::{sort_conversations_by_earliest, ChatReader, Message};
+use cc_history_lib::{
+    archive_root_dir, archive_session, duplicate_session,
+    rename_session as lib_rename_session, repath_session as lib_repath_session,
+    sort_conversations_by_earliest, unarchive_session, ChatReader, Message,
+};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1157,7 +1159,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
             sorting_indicator,
             watch_indicator,
             grouped_indicator,
-            chat_reader::short_path(fp)
+            cc_history_lib::short_path(fp)
         )
     } else {
         format!(
@@ -1228,7 +1230,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
                     let expanded = app.expanded_paths.contains(path);
                     let arrow = if expanded { "▼" } else { "▶" };
                     let date = format_time(*newest_date_ms);
-                    let cwd_raw = chat_reader::short_path(path);
+                    let cwd_raw = cc_history_lib::short_path(path);
                     let count_str = format!(" ({})", count);
                     // Reserve space for arrow and count in path column
                     let path_content = format!("{} {}{}", arrow, cwd_raw, count_str);
@@ -1261,7 +1263,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 }
                 DisplayRow::Conversation(r) => {
                     let date = format_time(r.date_ms);
-                    let cwd_raw = chat_reader::short_path(&r.path);
+                    let cwd_raw = cc_history_lib::short_path(&r.path);
                     // Indent conversations under groups
                     let cwd_display = if app.grouped_mode {
                         format!("  {}", cwd_raw)
@@ -1568,7 +1570,6 @@ fn open_selected_session(app: &mut App, viewport_height: Option<u16>) {
 }
 
 fn archive_selected_session(app: &mut App) -> Result<()> {
-    // Get the conversation row from display_rows
     let selected_row = match app.display_rows.get(app.selected) {
         Some(DisplayRow::Conversation(r)) => r.clone(),
         Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot archive a group header")),
@@ -1576,29 +1577,8 @@ fn archive_selected_session(app: &mut App) -> Result<()> {
     };
 
     let original_path = PathBuf::from(&selected_row.file_path);
-    if !original_path.exists() {
-        return Err(anyhow!(
-            "Session file not found at {}",
-            original_path.display()
-        ));
-    }
-
-    let relative_path = compute_relative_path(&original_path, &app.projects_dir)?;
-    let archive_root = archive_root_dir(&app.projects_dir);
-    let archived_path = archive_root.join(&relative_path);
-
-    if archived_path.exists() {
-        return Err(anyhow!(
-            "Archive destination already exists: {}",
-            archived_path.display()
-        ));
-    }
-
-    if let Some(parent) = archived_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::rename(&original_path, &archived_path)?;
+    let action = archive_session(&original_path, &app.projects_dir)
+        .map_err(|e| anyhow!("{}", e))?;
 
     app.messages_cache.remove(&selected_row.id);
     app.first_msg_pending.remove(&selected_row.id);
@@ -1610,15 +1590,14 @@ fn archive_selected_session(app: &mut App) -> Result<()> {
 
     app.last_archived = Some(ArchivedAction {
         row: selected_row,
-        original_path,
-        archived_path,
+        original_path: action.original_path,
+        archived_path: action.new_path,
     });
 
     Ok(())
 }
 
 fn unarchive_selected_session(app: &mut App) -> Result<()> {
-    // This function restores a session from archive back to projects
     let selected_row = match app.display_rows.get(app.selected) {
         Some(DisplayRow::Conversation(r)) => r.clone(),
         Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot unarchive a group header")),
@@ -1626,34 +1605,10 @@ fn unarchive_selected_session(app: &mut App) -> Result<()> {
     };
 
     let archived_path = PathBuf::from(&selected_row.file_path);
-    if !archived_path.exists() {
-        return Err(anyhow!(
-            "Archived session file not found at {}",
-            archived_path.display()
-        ));
-    }
+    let archive_dir = archive_root_dir(&app.base_projects_dir);
+    let action = unarchive_session(&archived_path, &archive_dir, &app.base_projects_dir)
+        .map_err(|e| anyhow!("{}", e))?;
 
-    // Compute the relative path within the archive directory
-    let archive_root = archive_root_dir(&app.base_projects_dir);
-    let relative_path = compute_relative_path(&archived_path, &archive_root)?;
-
-    // Destination is in the base projects directory
-    let restored_path = app.base_projects_dir.join(&relative_path);
-
-    if restored_path.exists() {
-        return Err(anyhow!(
-            "Destination already exists: {}",
-            restored_path.display()
-        ));
-    }
-
-    if let Some(parent) = restored_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::rename(&archived_path, &restored_path)?;
-
-    // Remove from current view
     app.messages_cache.remove(&selected_row.id);
     app.first_msg_pending.remove(&selected_row.id);
     let _ = remove_row_by_id(&mut app.all_rows, &selected_row.id);
@@ -1662,25 +1617,16 @@ fn unarchive_selected_session(app: &mut App) -> Result<()> {
     app.rebuild_display_rows();
     adjust_selection_after_change(app);
 
-    // Store the action for potential undo (reversed: archived_path is where it was,
-    // original_path is where it's going)
     app.last_archived = Some(ArchivedAction {
         row: selected_row,
-        original_path: restored_path,
-        archived_path,
+        original_path: action.new_path,
+        archived_path: action.original_path,
     });
 
     Ok(())
 }
 
-fn generate_uuid() -> Result<String> {
-    let output = std::process::Command::new("uuidgen").output()?;
-    let s = String::from_utf8(output.stdout)?;
-    Ok(s.trim().to_lowercase())
-}
-
 fn duplicate_selected_session(app: &mut App) -> Result<()> {
-    // Get the conversation row from display_rows
     let selected_row = match app.display_rows.get(app.selected) {
         Some(DisplayRow::Conversation(r)) => r.clone(),
         Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot duplicate a group header")),
@@ -1688,56 +1634,12 @@ fn duplicate_selected_session(app: &mut App) -> Result<()> {
     };
 
     let original_path = PathBuf::from(&selected_row.file_path);
-    if !original_path.exists() {
-        return Err(anyhow!(
-            "Session file not found at {}",
-            original_path.display()
-        ));
-    }
-
-    let new_id = generate_uuid()?;
-    let extension = original_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("jsonl");
-    let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
-    let new_path = parent.join(format!("{}.{}", new_id, extension));
-
-    if new_path.exists() {
-        return Err(anyhow!("Generated UUID collision, try again"));
-    }
-
-    {
-        let mut source = fs::File::open(&original_path)?;
-        let mut dest = fs::File::create(&new_path)?;
-
-        // Prepend a new summary so the list view shows it's a copy
-        let new_summary = if selected_row.first_msg.is_empty() {
-            format!("(Copy) {}", selected_row.id)
-        } else {
-            format!("(Copy) {}", selected_row.first_msg)
-        };
-
-        let summary_json = serde_json::json!({
-            "type": "summary",
-            "summary": new_summary
-        });
-        use std::io::Write;
-        writeln!(dest, "{}", summary_json)?;
-
-        // Copy original content
-        std::io::copy(&mut source, &mut dest)?;
-
-        // Append duplication message for the chat view
-        let dup_msg = serde_json::json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": format!("Session duplicated from {}", selected_row.id)
-            }
-        });
-        writeln!(dest, "{}", dup_msg)?;
-    }
+    let summary = if selected_row.first_msg.is_empty() {
+        None
+    } else {
+        Some(selected_row.first_msg.as_str())
+    };
+    duplicate_session(&original_path, summary).map_err(|e| anyhow!("{}", e))?;
 
     spawn_full_refresh(app);
 
@@ -1745,7 +1647,6 @@ fn duplicate_selected_session(app: &mut App) -> Result<()> {
 }
 
 fn rename_selected_session(app: &mut App) -> Result<()> {
-    // Get the conversation row from display_rows
     let selected_row = match app.display_rows.get(app.selected) {
         Some(DisplayRow::Conversation(r)) => r.clone(),
         Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot rename a group header")),
@@ -1753,49 +1654,12 @@ fn rename_selected_session(app: &mut App) -> Result<()> {
     };
 
     let original_path = PathBuf::from(&selected_row.file_path);
-    if !original_path.exists() {
-        return Err(anyhow!(
-            "Session file not found at {}",
-            original_path.display()
-        ));
-    }
+    lib_rename_session(&original_path, &app.rename_query).map_err(|e| anyhow!("{}", e))?;
 
-    let parent = original_path.parent().unwrap_or_else(|| Path::new("."));
-    let temp_uuid = generate_uuid()?;
-    let temp_path = parent.join(format!(".rename-{}.tmp", temp_uuid));
-
-    {
-        let source = fs::File::open(&original_path)?;
-        let reader = io::BufReader::new(source);
-        let mut dest = fs::File::create(&temp_path)?;
-
-        let summary_json = serde_json::json!({
-            "type": "summary",
-            "summary": app.rename_query
-        });
-        use std::io::Write;
-        writeln!(dest, "{}", summary_json)?;
-
-        use std::io::BufRead;
-        for line in reader.lines() {
-            let line = line?;
-            // Filter out existing summary lines to avoid duplication
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("type").and_then(|x| x.as_str()) == Some("summary") {
-                    continue;
-                }
-            }
-            writeln!(dest, "{}", line)?;
-        }
-    }
-
-    fs::rename(&temp_path, &original_path)?;
-
-    app.last_renamed = Some((original_path.clone(), Instant::now()));
+    app.last_renamed = Some((original_path, Instant::now()));
 
     let preview = single_line_preview(&app.rename_query, 240);
 
-    // Update memory
     if let Some(row) = app.all_rows.iter_mut().find(|r| r.id == selected_row.id) {
         row.first_msg = preview.clone();
     }
@@ -1803,23 +1667,10 @@ fn rename_selected_session(app: &mut App) -> Result<()> {
         row.first_msg = preview;
     }
 
-    // We don't need a full refresh because we updated in-place.
-    // The filesystem watcher might trigger one eventually, but we don't need to force it now.
-    // spawn_full_refresh(app);
-
     Ok(())
 }
 
-/// Encode a filesystem path into Claude's project directory naming scheme.
-/// e.g., "/Users/js/code/project" -> "-Users-js-code-project"
-/// e.g., "/Users/js/code/visma.admin" -> "-Users-js-code-visma-admin"
-/// Claude replaces both '/' and '.' with '-'
-fn encode_path_to_dir_name(path: &str) -> String {
-    path.replace(['/', '.'], "-")
-}
-
 fn repath_selected_session(app: &mut App) -> Result<()> {
-    // Get the conversation row from display_rows
     let selected_row = match app.display_rows.get(app.selected) {
         Some(DisplayRow::Conversation(r)) => r.clone(),
         Some(DisplayRow::Group { .. }) => return Err(anyhow!("Cannot repath a group header")),
@@ -1827,134 +1678,15 @@ fn repath_selected_session(app: &mut App) -> Result<()> {
     };
 
     let original_file_path = PathBuf::from(&selected_row.file_path);
-    if !original_file_path.exists() {
-        return Err(anyhow!(
-            "Session file not found at {}",
-            original_file_path.display()
-        ));
-    }
-
     let new_cwd = app.repath_query.trim();
-    if new_cwd.is_empty() {
-        return Err(anyhow!("New path cannot be empty"));
-    }
+    let action = lib_repath_session(&original_file_path, new_cwd, &app.projects_dir)
+        .map_err(|e| anyhow!("{}", e))?;
 
-    // Get the session filename (e.g., "b6de2331-c27d-4935-871c-fea9d24f88d3.jsonl")
-    let file_name = original_file_path
-        .file_name()
-        .ok_or_else(|| anyhow!("Invalid file path"))?;
-
-    // Compute the new directory name based on the new path
-    let new_dir_name = encode_path_to_dir_name(new_cwd);
-    let new_dir = app.projects_dir.join(&new_dir_name);
-
-    // Create the new directory if it doesn't exist
-    fs::create_dir_all(&new_dir)?;
-
-    // Compute the new file path
-    let new_file_path = new_dir.join(file_name);
-
-    // Check if destination already exists (different session with same ID - unlikely but possible)
-    if new_file_path.exists() && new_file_path != original_file_path {
-        return Err(anyhow!(
-            "A session file already exists at {}",
-            new_file_path.display()
-        ));
-    }
-
-    // If the paths are the same, just update metadata
-    if new_file_path == original_file_path {
-        // Only need to update the cwd metadata inside the file
-        let parent = original_file_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        let temp_uuid = generate_uuid()?;
-        let temp_path = parent.join(format!(".repath-{}.tmp", temp_uuid));
-
-        {
-            let source = fs::File::open(&original_file_path)?;
-            let reader = io::BufReader::new(source);
-            let mut dest = fs::File::create(&temp_path)?;
-
-            let metadata_json = serde_json::json!({
-                "type": "metadata",
-                "cwd": new_cwd
-            });
-            use std::io::Write;
-            writeln!(dest, "{}", metadata_json)?;
-
-            use std::io::BufRead;
-            for line in reader.lines() {
-                let line = line?;
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if v.get("type").and_then(|x| x.as_str()) == Some("metadata") {
-                        if let Some(obj) = v.as_object() {
-                            let has_only_path_fields = obj.keys().all(|k| {
-                                matches!(k.as_str(), "type" | "cwd" | "workspace" | "path")
-                            });
-                            if has_only_path_fields {
-                                continue;
-                            }
-                        }
-                    }
-                }
-                writeln!(dest, "{}", line)?;
-            }
-        }
-
-        fs::rename(&temp_path, &original_file_path)?;
-    } else {
-        // Need to move the file to a new directory
-        // First, create a temp file in the new directory with updated metadata
-        let temp_uuid = generate_uuid()?;
-        let temp_path = new_dir.join(format!(".repath-{}.tmp", temp_uuid));
-
-        {
-            let source = fs::File::open(&original_file_path)?;
-            let reader = io::BufReader::new(source);
-            let mut dest = fs::File::create(&temp_path)?;
-
-            // Prepend a metadata line with the new cwd
-            let metadata_json = serde_json::json!({
-                "type": "metadata",
-                "cwd": new_cwd
-            });
-            use std::io::Write;
-            writeln!(dest, "{}", metadata_json)?;
-
-            use std::io::BufRead;
-            for line in reader.lines() {
-                let line = line?;
-                // Filter out existing metadata lines that only contain cwd/workspace/path
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if v.get("type").and_then(|x| x.as_str()) == Some("metadata") {
-                        if let Some(obj) = v.as_object() {
-                            let has_only_path_fields = obj.keys().all(|k| {
-                                matches!(k.as_str(), "type" | "cwd" | "workspace" | "path")
-                            });
-                            if has_only_path_fields {
-                                continue;
-                            }
-                        }
-                    }
-                }
-                writeln!(dest, "{}", line)?;
-            }
-        }
-
-        // Rename temp file to final destination
-        fs::rename(&temp_path, &new_file_path)?;
-
-        // Remove the original file
-        fs::remove_file(&original_file_path)?;
-    }
-
-    app.last_renamed = Some((new_file_path.clone(), Instant::now()));
+    app.last_renamed = Some((action.new_path.clone(), Instant::now()));
 
     let new_path_str = new_cwd.to_string();
-    let new_file_path_str = new_file_path.to_string_lossy().to_string();
+    let new_file_path_str = action.new_path.to_string_lossy().to_string();
 
-    // Update memory
     if let Some(row) = app.all_rows.iter_mut().find(|r| r.id == selected_row.id) {
         row.path = new_path_str.clone();
         row.file_path = new_file_path_str.clone();
@@ -2022,29 +1754,6 @@ fn undo_last_archive(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn compute_relative_path(source: &Path, projects_dir: &Path) -> Result<PathBuf> {
-    if let Ok(rel) = source.strip_prefix(projects_dir) {
-        return Ok(rel.to_path_buf());
-    }
-
-    let canonical_source = fs::canonicalize(source)?;
-    let canonical_projects = fs::canonicalize(projects_dir)?;
-
-    if let Ok(rel) = canonical_source.strip_prefix(&canonical_projects) {
-        return Ok(rel.to_path_buf());
-    }
-
-    Err(anyhow!(
-        "File {} is not inside projects directory {}",
-        source.display(),
-        projects_dir.display()
-    ))
-}
-
-fn archive_root_dir(projects_dir: &Path) -> PathBuf {
-    projects_dir.with_file_name("projects-archive")
-}
-
 fn remove_row_by_id(rows: &mut Vec<RowItem>, id: &str) -> Option<RowItem> {
     rows.iter()
         .position(|r| r.id == id)
@@ -2071,7 +1780,7 @@ fn sort_rows_by(rows: &mut [RowItem], key: SortKey, desc: bool) {
             for row in rows.iter_mut() {
                 if row.last_msg_ms.is_none() {
                     row.last_msg_ms =
-                        chat_reader::ChatReader::latest_message_time_ms(&row.file_path);
+                        ChatReader::latest_message_time_ms(&row.file_path);
                 }
             }
             if desc {
@@ -4500,7 +4209,7 @@ fn spawn_sort(app: &mut App) {
         if let SortKey::LastMsg = key {
             for r in rows.iter_mut() {
                 if r.last_msg_ms.is_none() {
-                    r.last_msg_ms = chat_reader::ChatReader::latest_message_time_ms(&r.file_path);
+                    r.last_msg_ms = ChatReader::latest_message_time_ms(&r.file_path);
                 }
             }
         }
@@ -4542,7 +4251,7 @@ fn spawn_list_search(app: &mut App) {
     let query = app.list_search_query.to_lowercase();
     let all_rows = app.all_rows.clone();
     thread::spawn(move || {
-        let reader = chat_reader::ChatReader::new();
+        let reader = ChatReader::new();
         let mut results: Vec<RowItem> = Vec::new();
         for r in all_rows.into_iter() {
             if let Ok((_, msgs)) = reader.get_messages_by_id(&r.id) {
@@ -4568,7 +4277,7 @@ fn spawn_full_refresh(app: &mut App) {
     let desc = app.sort_desc;
 
     thread::spawn(move || {
-        let reader = chat_reader::ChatReader::with_projects_dir(projects_dir);
+        let reader = ChatReader::with_projects_dir(projects_dir);
         let mut rows: Vec<RowItem> = Vec::new();
         if let Ok(convos) = reader.list_conversations() {
             rows = convos
@@ -4610,7 +4319,7 @@ fn spawn_full_refresh(app: &mut App) {
                 for r in rows.iter_mut() {
                     if r.last_msg_ms.is_none() {
                         r.last_msg_ms =
-                            chat_reader::ChatReader::latest_message_time_ms(&r.file_path);
+                            ChatReader::latest_message_time_ms(&r.file_path);
                     }
                 }
                 if desc {
@@ -4649,7 +4358,7 @@ fn apply_sort(app: &mut App) {
         SortKey::LastMsg => {
             for r in app.rows.iter_mut() {
                 if r.last_msg_ms.is_none() {
-                    r.last_msg_ms = chat_reader::ChatReader::latest_message_time_ms(&r.file_path);
+                    r.last_msg_ms = ChatReader::latest_message_time_ms(&r.file_path);
                 }
             }
             if app.sort_desc {
