@@ -18,7 +18,9 @@ fn enrich_with_index(conv: &ConversationMeta, cache: &mut SessionIndexCache, arc
         id: conv.id.clone(),
         path: conv.path.clone(),
         summary: conv.summary.clone(),
-        custom_title: index_entry.as_ref().and_then(|e| e.custom_title.clone()),
+        custom_title: conv.custom_title.clone().or_else(|| {
+            index_entry.as_ref().and_then(|e| e.custom_title.clone())
+        }),
         first_prompt: index_entry.as_ref().and_then(|e| e.first_prompt.clone()),
         git_branch: index_entry.as_ref().and_then(|e| e.git_branch.clone()),
         created_at: conv.created_at,

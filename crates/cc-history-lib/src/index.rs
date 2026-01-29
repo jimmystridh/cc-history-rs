@@ -126,9 +126,24 @@ pub fn update_custom_title(session_file: &Path, new_title: &str) -> Result<()> {
 
     if let Some(entry) = index.find_entry_mut(session_id) {
         entry.custom_title = Some(new_title.to_string());
-        index.save(&index_path)?;
+    } else {
+        index.entries.push(SessionIndexEntry {
+            session_id: session_id.to_string(),
+            full_path: session_file.to_string_lossy().to_string(),
+            custom_title: Some(new_title.to_string()),
+            file_mtime: None,
+            first_prompt: None,
+            summary: None,
+            message_count: None,
+            created: None,
+            modified: None,
+            git_branch: None,
+            project_path: None,
+            is_sidechain: None,
+        });
     }
 
+    index.save(&index_path)?;
     Ok(())
 }
 

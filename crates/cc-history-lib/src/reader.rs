@@ -19,6 +19,7 @@ pub struct ConversationMeta {
     pub created_at: Option<i64>,
     pub file: PathBuf,
     pub summary: Option<String>,
+    pub custom_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,21 +243,28 @@ impl ChatReader {
                 if id.starts_with("agent-") {
                     continue;
                 }
-                let (summary, cwd, created_at) = if let Ok(file) = File::open(path) {
+                let (summary, custom_title, cwd, created_at) = if let Ok(file) = File::open(path) {
                     let reader = BufReader::new(file);
                     let mut summary: Option<String> = None;
+                    let mut custom_title: Option<String> = None;
                     let mut cwd = None;
                     let mut created_at = None;
 
                     for line_str in reader.lines().map_while(std::result::Result::ok) {
                         if let Ok(v) = serde_json::from_str::<Value>(&line_str) {
-                            if summary.is_none()
-                                && v.get("type").and_then(|x| x.as_str()) == Some("summary")
-                            {
-                                summary = v
-                                    .get("summary")
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string());
+                            if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
+                                if t == "summary" && summary.is_none() {
+                                    summary = v
+                                        .get("summary")
+                                        .and_then(|x| x.as_str())
+                                        .map(|s| s.to_string());
+                                }
+                                if t == "custom-title" {
+                                    custom_title = v
+                                        .get("customTitle")
+                                        .and_then(|x| x.as_str())
+                                        .map(|s| s.to_string());
+                                }
                             }
 
                             if cwd.is_none() || created_at.is_none() {
@@ -268,15 +276,11 @@ impl ChatReader {
                                     created_at = maybe_created;
                                 }
                             }
-
-                            if cwd.is_some() && created_at.is_some() {
-                                break;
-                            }
                         }
                     }
-                    (summary, cwd, created_at)
+                    (summary, custom_title, cwd, created_at)
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 };
                 list.push(ConversationMeta {
                     id,
@@ -284,6 +288,7 @@ impl ChatReader {
                     created_at,
                     file: path.to_path_buf(),
                     summary,
+                    custom_title,
                 });
             }
         }
@@ -327,6 +332,7 @@ impl ChatReader {
         let f = File::open(path)?;
         let mut msgs = Vec::new();
         let mut summary: Option<String> = None;
+        let mut custom_title: Option<String> = None;
         let mut meta_cwd: Option<String> = None;
         let mut meta_created_at: Option<i64> = None;
 
@@ -357,11 +363,19 @@ impl ChatReader {
                 Err(_) => continue,
             };
 
-            if summary.is_none() && v.get("type").and_then(|x| x.as_str()) == Some("summary") {
-                summary = v
-                    .get("summary")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string());
+            if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
+                if t == "summary" && summary.is_none() {
+                    summary = v
+                        .get("summary")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                }
+                if t == "custom-title" {
+                    custom_title = v
+                        .get("customTitle")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                }
             }
 
             if meta_cwd.is_none() || meta_created_at.is_none() {
@@ -656,6 +670,7 @@ impl ChatReader {
             created_at: meta_created_at,
             file: path.to_path_buf(),
             summary,
+            custom_title,
         };
         Ok((meta, msgs))
     }

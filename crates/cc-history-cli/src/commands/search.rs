@@ -22,7 +22,9 @@ fn search_conversation(
     archived: bool,
 ) -> Option<SearchResultItem> {
     let index_entry = cache.find_entry_for_session(&conv.file);
-    let custom_title = index_entry.as_ref().and_then(|e| e.custom_title.clone());
+    let custom_title = conv.custom_title.clone().or_else(|| {
+        index_entry.as_ref().and_then(|e| e.custom_title.clone())
+    });
     let first_prompt = index_entry.as_ref().and_then(|e| e.first_prompt.clone());
     let git_branch = index_entry.as_ref().and_then(|e| e.git_branch.clone());
 
