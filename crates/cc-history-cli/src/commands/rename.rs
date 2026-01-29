@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cc_history_lib::{archive_root_dir, rename_session, ChatReader};
+use cc_history_lib::{archive_root_dir, rename_session, update_custom_title, ChatReader};
 use clap::Args;
 
 use crate::models::ActionOutput;
@@ -9,7 +9,7 @@ pub struct RenameArgs {
     /// Session ID to rename
     pub id: String,
 
-    /// New summary/name
+    /// New title/name for the session
     pub name: String,
 }
 
@@ -28,6 +28,10 @@ pub fn execute(reader: &ChatReader, args: &RenameArgs) -> Result<ActionOutput> {
     };
 
     let result = rename_session(&meta.file, &args.name)?;
+
+    if let Err(e) = update_custom_title(&meta.file, &args.name) {
+        eprintln!("Warning: Could not update sessions-index.json: {}", e);
+    }
 
     Ok(ActionOutput {
         action: "Renamed".into(),

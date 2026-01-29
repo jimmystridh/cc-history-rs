@@ -9,6 +9,12 @@ pub struct ConversationItem {
     pub id: String,
     pub path: Option<String>,
     pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
     pub created_at: Option<i64>,
     pub archived: bool,
 }
@@ -31,28 +37,36 @@ impl Formattable for ConversationListOutput {
                 .map(|p| short_path(p))
                 .unwrap_or_else(|| "(no path)".into());
 
-            let summary_display = conv
-                .summary
+            let title_display = conv
+                .custom_title
                 .as_ref()
-                .map(|s| {
-                    let truncated: String = s.chars().take(60).collect();
-                    if s.len() > 60 {
-                        format!("{}...", truncated)
-                    } else {
-                        truncated
-                    }
-                })
-                .unwrap_or_else(|| "(no summary)".into());
+                .or(conv.summary.as_ref())
+                .map(|s| truncate_str(s, 60))
+                .unwrap_or_else(|| "(no title)".into());
 
             let archived_marker = if conv.archived { " [archived]" } else { "" };
+            let branch_marker = conv
+                .git_branch
+                .as_ref()
+                .map(|b| format!(" ({})", b))
+                .unwrap_or_default();
 
             out.push_str(&format!(
-                "- **{}**{}\n  {}\n  {}\n\n",
-                conv.id, archived_marker, path_display, summary_display
+                "- **{}**{}{}\n  {}\n  {}\n\n",
+                conv.id, archived_marker, branch_marker, path_display, title_display
             ));
         }
 
         Ok(out)
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    let truncated: String = s.chars().take(max_len).collect();
+    if s.chars().count() > max_len {
+        format!("{}...", truncated)
+    } else {
+        truncated
     }
 }
 
@@ -111,6 +125,12 @@ pub struct SearchResultItem {
     pub id: String,
     pub path: Option<String>,
     pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
     pub match_context: Option<String>,
     pub archived: bool,
 }
@@ -138,11 +158,18 @@ impl Formattable for SearchOutput {
                 .unwrap_or_else(|| "(no path)".into());
 
             let archived_marker = if result.archived { " [archived]" } else { "" };
+            let branch_marker = result
+                .git_branch
+                .as_ref()
+                .map(|b| format!(" ({})", b))
+                .unwrap_or_default();
 
-            out.push_str(&format!("## {}{}\n\n", result.id, archived_marker));
+            out.push_str(&format!("## {}{}{}\n\n", result.id, archived_marker, branch_marker));
             out.push_str(&format!("**Path:** {}\n", path_display));
 
-            if let Some(summary) = &result.summary {
+            if let Some(title) = &result.custom_title {
+                out.push_str(&format!("**Title:** {}\n", title));
+            } else if let Some(summary) = &result.summary {
                 out.push_str(&format!("**Summary:** {}\n", summary));
             }
 

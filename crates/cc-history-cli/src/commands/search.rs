@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cc_history_lib::{archive_root_dir, ChatReader};
+use cc_history_lib::{archive_root_dir, ChatReader, ConversationMeta, SessionIndexCache};
 use clap::Args;
 
 use crate::models::{SearchOutput, SearchResultItem};
@@ -14,41 +14,73 @@ pub struct SearchArgs {
     pub archived: bool,
 }
 
-pub fn execute(reader: &ChatReader, args: &SearchArgs) -> Result<SearchOutput> {
-    let query_lower = args.query.to_lowercase();
-    let mut results = Vec::new();
+fn search_conversation(
+    conv: &ConversationMeta,
+    reader: &ChatReader,
+    cache: &mut SessionIndexCache,
+    query_lower: &str,
+    archived: bool,
+) -> Option<SearchResultItem> {
+    let index_entry = cache.find_entry_for_session(&conv.file);
+    let custom_title = index_entry.as_ref().and_then(|e| e.custom_title.clone());
+    let first_prompt = index_entry.as_ref().and_then(|e| e.first_prompt.clone());
+    let git_branch = index_entry.as_ref().and_then(|e| e.git_branch.clone());
 
-    for conv in reader.list_conversations()? {
-        let mut matched = false;
-        let mut match_context = None;
+    let mut match_context = None;
 
+    if let Some(ref title) = custom_title {
+        if title.to_lowercase().contains(query_lower) {
+            match_context = Some(truncate_around_match(title, query_lower, 80));
+        }
+    }
+
+    if match_context.is_none() {
         if let Some(ref summary) = conv.summary {
-            if summary.to_lowercase().contains(&query_lower) {
-                matched = true;
-                match_context = Some(truncate_around_match(summary, &query_lower, 80));
+            if summary.to_lowercase().contains(query_lower) {
+                match_context = Some(truncate_around_match(summary, query_lower, 80));
             }
         }
+    }
 
-        if !matched {
-            if let Ok((_, messages)) = reader.get_messages_by_id(&conv.id) {
-                for msg in &messages {
-                    if msg.content.to_lowercase().contains(&query_lower) {
-                        matched = true;
-                        match_context = Some(truncate_around_match(&msg.content, &query_lower, 80));
-                        break;
-                    }
+    if match_context.is_none() {
+        if let Some(ref prompt) = first_prompt {
+            if prompt.to_lowercase().contains(query_lower) {
+                match_context = Some(truncate_around_match(prompt, query_lower, 80));
+            }
+        }
+    }
+
+    if match_context.is_none() {
+        if let Ok((_, messages)) = reader.get_messages_by_id(&conv.id) {
+            for msg in &messages {
+                if msg.content.to_lowercase().contains(query_lower) {
+                    match_context = Some(truncate_around_match(&msg.content, query_lower, 80));
+                    break;
                 }
             }
         }
+    }
 
-        if matched {
-            results.push(SearchResultItem {
-                id: conv.id,
-                path: conv.path,
-                summary: conv.summary,
-                match_context,
-                archived: false,
-            });
+    match_context.map(|ctx| SearchResultItem {
+        id: conv.id.clone(),
+        path: conv.path.clone(),
+        summary: conv.summary.clone(),
+        custom_title,
+        first_prompt,
+        git_branch,
+        match_context: Some(ctx),
+        archived,
+    })
+}
+
+pub fn execute(reader: &ChatReader, args: &SearchArgs) -> Result<SearchOutput> {
+    let query_lower = args.query.to_lowercase();
+    let mut results = Vec::new();
+    let mut cache = SessionIndexCache::new();
+
+    for conv in reader.list_conversations()? {
+        if let Some(result) = search_conversation(&conv, reader, &mut cache, &query_lower, false) {
+            results.push(result);
         }
     }
 
@@ -57,37 +89,10 @@ pub fn execute(reader: &ChatReader, args: &SearchArgs) -> Result<SearchOutput> {
         if archive_dir.exists() {
             let archive_reader = ChatReader::with_projects_dir(archive_dir);
             for conv in archive_reader.list_conversations()? {
-                let mut matched = false;
-                let mut match_context = None;
-
-                if let Some(ref summary) = conv.summary {
-                    if summary.to_lowercase().contains(&query_lower) {
-                        matched = true;
-                        match_context = Some(truncate_around_match(summary, &query_lower, 80));
-                    }
-                }
-
-                if !matched {
-                    if let Ok((_, messages)) = archive_reader.get_messages_by_id(&conv.id) {
-                        for msg in &messages {
-                            if msg.content.to_lowercase().contains(&query_lower) {
-                                matched = true;
-                                match_context =
-                                    Some(truncate_around_match(&msg.content, &query_lower, 80));
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if matched {
-                    results.push(SearchResultItem {
-                        id: conv.id,
-                        path: conv.path,
-                        summary: conv.summary,
-                        match_context,
-                        archived: true,
-                    });
+                if let Some(result) =
+                    search_conversation(&conv, &archive_reader, &mut cache, &query_lower, true)
+                {
+                    results.push(result);
                 }
             }
         }
