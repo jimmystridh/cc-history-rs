@@ -377,7 +377,10 @@ impl App {
             Some(DisplayRow::Conversation(row)) => Some(row.id.clone()),
             Some(DisplayRow::Group { path, .. }) => {
                 // For group headers, find the first conversation in that group
-                self.rows.iter().find(|r| &r.path == path).map(|r| r.id.clone())
+                self.rows
+                    .iter()
+                    .find(|r| &r.path == path)
+                    .map(|r| r.id.clone())
             }
             None => None,
         };
@@ -404,14 +407,16 @@ impl App {
             return;
         }
 
-        let mut target_index =
-            saved_index.unwrap_or_else(|| self.selected.min(self.display_rows.len().saturating_sub(1)));
+        let mut target_index = saved_index
+            .unwrap_or_else(|| self.selected.min(self.display_rows.len().saturating_sub(1)));
 
         if let Some(id) = saved_id {
             // Search display_rows for a conversation with matching ID
-            if let Some(pos) = self.display_rows.iter().position(|dr| {
-                matches!(dr, DisplayRow::Conversation(r) if r.id == id)
-            }) {
+            if let Some(pos) = self
+                .display_rows
+                .iter()
+                .position(|dr| matches!(dr, DisplayRow::Conversation(r) if r.id == id))
+            {
                 target_index = pos;
             }
         }
@@ -3144,7 +3149,8 @@ fn main() -> Result<()> {
                     // any non-empty first_msg from the old rows.
                     for new_row in &mut new_rows {
                         if new_row.first_msg.is_empty() {
-                            if let Some(old_row) = app.all_rows.iter().find(|r| r.id == new_row.id) {
+                            if let Some(old_row) = app.all_rows.iter().find(|r| r.id == new_row.id)
+                            {
                                 if !old_row.first_msg.is_empty() {
                                     new_row.first_msg = old_row.first_msg.clone();
                                 }
@@ -4113,11 +4119,7 @@ fn ensure_first_msgs(app: &mut App, area: Rect) {
 /// that show this conversation as their newest preview.
 fn update_display_row_first_msg(app: &mut App, id: &str, first_msg: &str) {
     // Find the path of this conversation so we can update group headers if needed
-    let path = app
-        .rows
-        .iter()
-        .find(|r| r.id == id)
-        .map(|r| r.path.clone());
+    let path = app.rows.iter().find(|r| r.id == id).map(|r| r.path.clone());
 
     for dr in &mut app.display_rows {
         match dr {
