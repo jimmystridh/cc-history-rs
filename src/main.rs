@@ -3322,11 +3322,11 @@ fn main() -> Result<()> {
             // Precompute size for lazy loading of first message previews
             if let Ok(sz) = terminal.size() {
                 if let Mode::List = app.mode {
-                    ensure_first_msgs(&mut app, sz);
+                    ensure_first_msgs(&mut app, sz.into());
                 }
             }
             terminal.draw(|f| {
-                let size = f.size();
+                let size = f.area();
                 match app.mode {
                     Mode::List => render_list(f, size, &app),
                     Mode::View => render_view(f, size, &app),
@@ -4017,8 +4017,12 @@ fn main() -> Result<()> {
                 Event::Mouse(mouse_event) => {
                     if let Ok(size) = terminal.size() {
                         let handled = match app.mode {
-                            Mode::List => handle_list_mouse_event(&mut app, &mouse_event, size),
-                            Mode::View => handle_view_mouse_event(&mut app, &mouse_event, size),
+                            Mode::List => {
+                                handle_list_mouse_event(&mut app, &mouse_event, size.into())
+                            }
+                            Mode::View => {
+                                handle_view_mouse_event(&mut app, &mouse_event, size.into())
+                            }
                         };
                         if handled {
                             needs_redraw = true;
