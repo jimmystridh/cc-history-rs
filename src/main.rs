@@ -15,6 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Terminal;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -263,7 +264,7 @@ impl App {
             });
         }
         // Default sort: newest on top (created desc)
-        rows.sort_by(|a, b| b.date_ms.cmp(&a.date_ms));
+        rows.sort_by_key(|row| Reverse(row.date_ms));
 
         // Optionally set up FS watcher ping channel based on preference
         let ping_rx = if watch_pref {
@@ -507,12 +508,10 @@ impl App {
 
     fn collapse_group_at_selected(&mut self) {
         match self.display_rows.get(self.selected) {
-            Some(DisplayRow::Group { path, .. }) => {
-                if self.expanded_paths.contains(path) {
-                    let path = path.clone();
-                    self.expanded_paths.remove(&path);
-                    self.rebuild_display_rows();
-                }
+            Some(DisplayRow::Group { path, .. }) if self.expanded_paths.contains(path) => {
+                let path = path.clone();
+                self.expanded_paths.remove(&path);
+                self.rebuild_display_rows();
             }
             Some(DisplayRow::Conversation(row)) => {
                 // If on a conversation, collapse its parent group and move selection to group header
@@ -531,6 +530,7 @@ impl App {
                     }
                 }
             }
+            Some(DisplayRow::Group { .. }) => {}
             None => {}
         }
     }
@@ -1355,70 +1355,64 @@ fn handle_list_mouse_event(app: &mut App, mouse: &MouseEvent, viewport: Rect) ->
     let mut changed = false;
 
     match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if rect_contains(inner_area, column, row) {
-                let offset = usize::from(row.saturating_sub(inner_area.y));
-                let idx = app.top.saturating_add(offset);
-                if idx < app.rows.len() {
-                    if app.selected != idx {
-                        app.selected = idx;
-                        changed = true;
-                    } else {
-                        open_selected_session(app, Some(viewport.height));
-                        changed = true;
-                    }
+        MouseEventKind::Down(MouseButton::Left) if rect_contains(inner_area, column, row) => {
+            let offset = usize::from(row.saturating_sub(inner_area.y));
+            let idx = app.top.saturating_add(offset);
+            if idx < app.rows.len() {
+                if app.selected != idx {
+                    app.selected = idx;
+                    changed = true;
+                } else {
+                    open_selected_session(app, Some(viewport.height));
+                    changed = true;
                 }
             }
         }
-        MouseEventKind::ScrollUp => {
-            if rect_contains(table_area, column, row) {
-                let step = MOUSE_SCROLL_LINES.max(1);
-                let prev_selected = app.selected;
-                let prev_top = app.top;
+        MouseEventKind::ScrollUp if rect_contains(table_area, column, row) => {
+            let step = MOUSE_SCROLL_LINES.max(1);
+            let prev_selected = app.selected;
+            let prev_top = app.top;
 
-                if app.selected > 0 {
-                    app.selected = app.selected.saturating_sub(step);
-                    if app.selected < app.top {
-                        app.top = app.selected;
-                    }
-                } else if app.top > 0 {
-                    app.top = app.top.saturating_sub(step);
-                }
-
-                if app.top > app.selected {
+            if app.selected > 0 {
+                app.selected = app.selected.saturating_sub(step);
+                if app.selected < app.top {
                     app.top = app.selected;
                 }
+            } else if app.top > 0 {
+                app.top = app.top.saturating_sub(step);
+            }
 
-                if prev_selected != app.selected || prev_top != app.top {
-                    changed = true;
-                }
+            if app.top > app.selected {
+                app.top = app.selected;
+            }
+
+            if prev_selected != app.selected || prev_top != app.top {
+                changed = true;
             }
         }
-        MouseEventKind::ScrollDown => {
-            if rect_contains(table_area, column, row) {
-                let step = MOUSE_SCROLL_LINES.max(1);
-                let prev_selected = app.selected;
-                let prev_top = app.top;
+        MouseEventKind::ScrollDown if rect_contains(table_area, column, row) => {
+            let step = MOUSE_SCROLL_LINES.max(1);
+            let prev_selected = app.selected;
+            let prev_top = app.top;
 
-                let last_index = app.rows.len().saturating_sub(1);
-                if app.selected < last_index {
-                    app.selected = app.selected.saturating_add(step).min(last_index);
-                    let visible_end = app.top.saturating_add(view_height.saturating_sub(1));
-                    if app.selected > visible_end {
-                        let new_top = app.selected.saturating_sub(view_height.saturating_sub(1));
-                        let max_top = app.rows.len().saturating_sub(view_height);
-                        app.top = new_top.min(max_top);
-                    }
-                } else {
+            let last_index = app.rows.len().saturating_sub(1);
+            if app.selected < last_index {
+                app.selected = app.selected.saturating_add(step).min(last_index);
+                let visible_end = app.top.saturating_add(view_height.saturating_sub(1));
+                if app.selected > visible_end {
+                    let new_top = app.selected.saturating_sub(view_height.saturating_sub(1));
                     let max_top = app.rows.len().saturating_sub(view_height);
-                    if app.top < max_top {
-                        app.top = app.top.saturating_add(step).min(max_top);
-                    }
+                    app.top = new_top.min(max_top);
                 }
+            } else {
+                let max_top = app.rows.len().saturating_sub(view_height);
+                if app.top < max_top {
+                    app.top = app.top.saturating_add(step).min(max_top);
+                }
+            }
 
-                if prev_selected != app.selected || prev_top != app.top {
-                    changed = true;
-                }
+            if prev_selected != app.selected || prev_top != app.top {
+                changed = true;
             }
         }
         _ => {}
@@ -1440,25 +1434,21 @@ fn handle_view_mouse_event(app: &mut App, mouse: &MouseEvent, viewport: Rect) ->
     let row = mouse.row;
 
     match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            if rect_contains(content_area, column, row) {
-                let step = MOUSE_SCROLL_LINES.max(1);
-                let new_scroll = current_scroll.saturating_sub(step);
-                if new_scroll != current_scroll {
-                    set_view_scroll(app, new_scroll, view_height);
-                    return true;
-                }
+        MouseEventKind::ScrollUp if rect_contains(content_area, column, row) => {
+            let step = MOUSE_SCROLL_LINES.max(1);
+            let new_scroll = current_scroll.saturating_sub(step);
+            if new_scroll != current_scroll {
+                set_view_scroll(app, new_scroll, view_height);
+                return true;
             }
         }
-        MouseEventKind::ScrollDown => {
-            if rect_contains(content_area, column, row) {
-                let step = MOUSE_SCROLL_LINES.max(1);
-                let new_scroll = current_scroll.saturating_add(step);
-                let before = app.view_scroll;
-                set_view_scroll(app, new_scroll, view_height);
-                if app.view_scroll != before {
-                    return true;
-                }
+        MouseEventKind::ScrollDown if rect_contains(content_area, column, row) => {
+            let step = MOUSE_SCROLL_LINES.max(1);
+            let new_scroll = current_scroll.saturating_add(step);
+            let before = app.view_scroll;
+            set_view_scroll(app, new_scroll, view_height);
+            if app.view_scroll != before {
+                return true;
             }
         }
         _ => {}
@@ -1994,16 +1984,16 @@ fn sort_rows_by(rows: &mut [RowItem], key: SortKey, desc: bool) {
     match key {
         SortKey::Created => {
             if desc {
-                rows.sort_by(|a, b| b.date_ms.cmp(&a.date_ms));
+                rows.sort_by_key(|row| Reverse(row.date_ms));
             } else {
-                rows.sort_by(|a, b| a.date_ms.cmp(&b.date_ms));
+                rows.sort_by_key(|row| row.date_ms);
             }
         }
         SortKey::Path => {
             if desc {
-                rows.sort_by(|a, b| b.path.to_lowercase().cmp(&a.path.to_lowercase()));
+                rows.sort_by_key(|row| Reverse(row.path.to_lowercase()));
             } else {
-                rows.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+                rows.sort_by_key(|row| row.path.to_lowercase());
             }
         }
         SortKey::LastMsg => {
@@ -2014,9 +2004,9 @@ fn sort_rows_by(rows: &mut [RowItem], key: SortKey, desc: bool) {
                 }
             }
             if desc {
-                rows.sort_by(|a, b| b.last_msg_ms.unwrap_or(0).cmp(&a.last_msg_ms.unwrap_or(0)));
+                rows.sort_by_key(|row| Reverse(row.last_msg_ms.unwrap_or(0)));
             } else {
-                rows.sort_by(|a, b| a.last_msg_ms.unwrap_or(0).cmp(&b.last_msg_ms.unwrap_or(0)));
+                rows.sort_by_key(|row| row.last_msg_ms.unwrap_or(0));
             }
         }
     }
@@ -3322,11 +3312,11 @@ fn main() -> Result<()> {
             // Precompute size for lazy loading of first message previews
             if let Ok(sz) = terminal.size() {
                 if let Mode::List = app.mode {
-                    ensure_first_msgs(&mut app, sz);
+                    ensure_first_msgs(&mut app, sz.into());
                 }
             }
             terminal.draw(|f| {
-                let size = f.size();
+                let size = f.area();
                 match app.mode {
                     Mode::List => render_list(f, size, &app),
                     Mode::View => render_view(f, size, &app),
@@ -3441,13 +3431,11 @@ fn main() -> Result<()> {
                                     }
                                     KeyCode::Char('r') if !app.is_input_active() => {
                                         // Resume: skip if on a group header
-                                        if !app.is_group_selected() {
-                                            if let Some(DisplayRow::Conversation(row)) =
-                                                app.display_rows.get(app.selected)
-                                            {
-                                                app.resume_session_request =
-                                                    Some((row.id.clone(), row.path.clone()));
-                                            }
+                                        if let Some(DisplayRow::Conversation(row)) =
+                                            app.display_rows.get(app.selected)
+                                        {
+                                            app.resume_session_request =
+                                                Some((row.id.clone(), row.path.clone()));
                                         }
                                     }
                                     KeyCode::Char('a') if !app.is_input_active() => {
@@ -3470,24 +3458,20 @@ fn main() -> Result<()> {
                                     }
                                     KeyCode::Char('n') if !app.is_input_active() => {
                                         // Rename: skip if on a group header
-                                        if !app.is_group_selected() {
-                                            if let Some(DisplayRow::Conversation(row)) =
-                                                app.display_rows.get(app.selected)
-                                            {
-                                                app.rename_input = true;
-                                                app.rename_query = row.first_msg.clone();
-                                            }
+                                        if let Some(DisplayRow::Conversation(row)) =
+                                            app.display_rows.get(app.selected)
+                                        {
+                                            app.rename_input = true;
+                                            app.rename_query = row.first_msg.clone();
                                         }
                                     }
                                     KeyCode::Char('p') if !app.is_input_active() => {
                                         // Repath: skip if on a group header
-                                        if !app.is_group_selected() {
-                                            if let Some(DisplayRow::Conversation(row)) =
-                                                app.display_rows.get(app.selected)
-                                            {
-                                                app.repath_input = true;
-                                                app.repath_query = row.path.clone();
-                                            }
+                                        if let Some(DisplayRow::Conversation(row)) =
+                                            app.display_rows.get(app.selected)
+                                        {
+                                            app.repath_input = true;
+                                            app.repath_query = row.path.clone();
                                         }
                                     }
                                     KeyCode::Char('u') if !app.is_input_active() => {
@@ -3552,15 +3536,17 @@ fn main() -> Result<()> {
                                         app.show_settings_modal = false;
                                         app.settings_selected_field = 0;
                                     }
-                                    KeyCode::Up if app.show_settings_modal => {
-                                        if app.settings_selected_field > 0 {
-                                            app.settings_selected_field -= 1;
-                                        }
+                                    KeyCode::Up
+                                        if app.show_settings_modal
+                                            && app.settings_selected_field > 0 =>
+                                    {
+                                        app.settings_selected_field -= 1;
                                     }
-                                    KeyCode::Down if app.show_settings_modal => {
-                                        if app.settings_selected_field < 1 {
-                                            app.settings_selected_field += 1;
-                                        }
+                                    KeyCode::Down
+                                        if app.show_settings_modal
+                                            && app.settings_selected_field < 1 =>
+                                    {
+                                        app.settings_selected_field += 1;
                                     }
                                     KeyCode::Backspace
                                         if app.show_settings_modal
@@ -3583,12 +3569,10 @@ fn main() -> Result<()> {
                                         app.settings_quit_after_launch =
                                             !app.settings_quit_after_launch;
                                     }
-                                    KeyCode::Up if !app.show_settings_modal => {
-                                        if app.selected > 0 {
-                                            app.selected -= 1;
-                                            if app.selected < app.top {
-                                                app.top = app.selected;
-                                            }
+                                    KeyCode::Up if !app.show_settings_modal && app.selected > 0 => {
+                                        app.selected -= 1;
+                                        if app.selected < app.top {
+                                            app.top = app.selected;
                                         }
                                     }
                                     KeyCode::Down if !app.show_settings_modal => {
@@ -3627,13 +3611,14 @@ fn main() -> Result<()> {
                                         app.selected = 0;
                                         app.top = 0;
                                     }
-                                    KeyCode::End | KeyCode::Char('G') if !app.is_input_active() => {
-                                        if !app.display_rows.is_empty() {
-                                            app.selected = app.display_rows.len() - 1;
-                                            if let Ok(size) = terminal.size() {
-                                                let view_h = list_visible_height(size.height);
-                                                adjust_list_window(&mut app, view_h);
-                                            }
+                                    KeyCode::End | KeyCode::Char('G')
+                                        if !app.is_input_active()
+                                            && !app.display_rows.is_empty() =>
+                                    {
+                                        app.selected = app.display_rows.len() - 1;
+                                        if let Ok(size) = terminal.size() {
+                                            let view_h = list_visible_height(size.height);
+                                            adjust_list_window(&mut app, view_h);
                                         }
                                     }
                                     KeyCode::Enter => {
@@ -3645,17 +3630,17 @@ fn main() -> Result<()> {
                                             open_selected_session(&mut app, height);
                                         }
                                     }
-                                    KeyCode::Right if !app.is_input_active() => {
+                                    KeyCode::Right
+                                        if !app.is_input_active()
+                                            && app.grouped_mode
+                                            && app.is_group_selected() =>
+                                    {
                                         // Expand group or do nothing
-                                        if app.grouped_mode && app.is_group_selected() {
-                                            app.expand_group_at_selected();
-                                        }
+                                        app.expand_group_at_selected();
                                     }
-                                    KeyCode::Left if !app.is_input_active() => {
+                                    KeyCode::Left if !app.is_input_active() && app.grouped_mode => {
                                         // Collapse group (or parent group if on conversation)
-                                        if app.grouped_mode {
-                                            app.collapse_group_at_selected();
-                                        }
+                                        app.collapse_group_at_selected();
                                     }
                                     KeyCode::Char('f') if !app.is_input_active() => {
                                         // Filter by path: works on both groups and conversations
@@ -3699,18 +3684,15 @@ fn main() -> Result<()> {
                                     }
                                     KeyCode::Char('e') if !app.is_input_active() => {
                                         // Export: skip if on a group header
-                                        if !app.is_group_selected() {
-                                            if let Some(DisplayRow::Conversation(row)) =
-                                                app.display_rows.get(app.selected)
-                                            {
-                                                if let Some(msgs) = app.messages_cache.get(&row.id)
+                                        if let Some(DisplayRow::Conversation(row)) =
+                                            app.display_rows.get(app.selected)
+                                        {
+                                            if let Some(msgs) = app.messages_cache.get(&row.id) {
+                                                let title = &row.id;
+                                                if let Ok(path) =
+                                                    export_html(title, &row.path, msgs)
                                                 {
-                                                    let title = &row.id;
-                                                    if let Ok(path) =
-                                                        export_html(title, &row.path, msgs)
-                                                    {
-                                                        let _ = open::that(path);
-                                                    }
+                                                    let _ = open::that(path);
                                                 }
                                             }
                                         }
@@ -4017,8 +3999,12 @@ fn main() -> Result<()> {
                 Event::Mouse(mouse_event) => {
                     if let Ok(size) = terminal.size() {
                         let handled = match app.mode {
-                            Mode::List => handle_list_mouse_event(&mut app, &mouse_event, size),
-                            Mode::View => handle_view_mouse_event(&mut app, &mouse_event, size),
+                            Mode::List => {
+                                handle_list_mouse_event(&mut app, &mouse_event, size.into())
+                            }
+                            Mode::View => {
+                                handle_view_mouse_event(&mut app, &mouse_event, size.into())
+                            }
                         };
                         if handled {
                             needs_redraw = true;
@@ -4255,27 +4241,23 @@ fn spawn_sort(app: &mut App) {
         match key {
             SortKey::Created => {
                 if desc {
-                    rows.sort_by(|a, b| b.date_ms.cmp(&a.date_ms));
+                    rows.sort_by_key(|row| Reverse(row.date_ms));
                 } else {
-                    rows.sort_by(|a, b| a.date_ms.cmp(&b.date_ms));
+                    rows.sort_by_key(|row| row.date_ms);
                 }
             }
             SortKey::Path => {
                 if desc {
-                    rows.sort_by(|a, b| b.path.to_lowercase().cmp(&a.path.to_lowercase()));
+                    rows.sort_by_key(|row| Reverse(row.path.to_lowercase()));
                 } else {
-                    rows.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+                    rows.sort_by_key(|row| row.path.to_lowercase());
                 }
             }
             SortKey::LastMsg => {
                 if desc {
-                    rows.sort_by(|a, b| {
-                        b.last_msg_ms.unwrap_or(0).cmp(&a.last_msg_ms.unwrap_or(0))
-                    });
+                    rows.sort_by_key(|row| Reverse(row.last_msg_ms.unwrap_or(0)));
                 } else {
-                    rows.sort_by(|a, b| {
-                        a.last_msg_ms.unwrap_or(0).cmp(&b.last_msg_ms.unwrap_or(0))
-                    });
+                    rows.sort_by_key(|row| row.last_msg_ms.unwrap_or(0));
                 }
             }
         }
@@ -4342,16 +4324,16 @@ fn spawn_full_refresh(app: &mut App) {
         match key {
             SortKey::Created => {
                 if desc {
-                    rows.sort_by(|a, b| b.date_ms.cmp(&a.date_ms));
+                    rows.sort_by_key(|row| Reverse(row.date_ms));
                 } else {
-                    rows.sort_by(|a, b| a.date_ms.cmp(&b.date_ms));
+                    rows.sort_by_key(|row| row.date_ms);
                 }
             }
             SortKey::Path => {
                 if desc {
-                    rows.sort_by(|a, b| b.path.to_lowercase().cmp(&a.path.to_lowercase()));
+                    rows.sort_by_key(|row| Reverse(row.path.to_lowercase()));
                 } else {
-                    rows.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+                    rows.sort_by_key(|row| row.path.to_lowercase());
                 }
             }
             SortKey::LastMsg => {
@@ -4362,13 +4344,9 @@ fn spawn_full_refresh(app: &mut App) {
                     }
                 }
                 if desc {
-                    rows.sort_by(|a, b| {
-                        b.last_msg_ms.unwrap_or(0).cmp(&a.last_msg_ms.unwrap_or(0))
-                    });
+                    rows.sort_by_key(|row| Reverse(row.last_msg_ms.unwrap_or(0)));
                 } else {
-                    rows.sort_by(|a, b| {
-                        a.last_msg_ms.unwrap_or(0).cmp(&b.last_msg_ms.unwrap_or(0))
-                    });
+                    rows.sort_by_key(|row| row.last_msg_ms.unwrap_or(0));
                 }
             }
         }
@@ -4380,18 +4358,16 @@ fn apply_sort(app: &mut App) {
     match app.sort_key {
         SortKey::Created => {
             if app.sort_desc {
-                app.rows.sort_by(|a, b| b.date_ms.cmp(&a.date_ms));
+                app.rows.sort_by_key(|row| Reverse(row.date_ms));
             } else {
-                app.rows.sort_by(|a, b| a.date_ms.cmp(&b.date_ms));
+                app.rows.sort_by_key(|row| row.date_ms);
             }
         }
         SortKey::Path => {
             if app.sort_desc {
-                app.rows
-                    .sort_by(|a, b| b.path.to_lowercase().cmp(&a.path.to_lowercase()));
+                app.rows.sort_by_key(|row| Reverse(row.path.to_lowercase()));
             } else {
-                app.rows
-                    .sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+                app.rows.sort_by_key(|row| row.path.to_lowercase());
             }
         }
         SortKey::LastMsg => {
@@ -4402,10 +4378,9 @@ fn apply_sort(app: &mut App) {
             }
             if app.sort_desc {
                 app.rows
-                    .sort_by(|a, b| b.last_msg_ms.unwrap_or(0).cmp(&a.last_msg_ms.unwrap_or(0)));
+                    .sort_by_key(|row| Reverse(row.last_msg_ms.unwrap_or(0)));
             } else {
-                app.rows
-                    .sort_by(|a, b| a.last_msg_ms.unwrap_or(0).cmp(&b.last_msg_ms.unwrap_or(0)));
+                app.rows.sort_by_key(|row| row.last_msg_ms.unwrap_or(0));
             }
         }
     }
