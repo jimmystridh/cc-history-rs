@@ -243,15 +243,23 @@ impl ChatReader {
                 if id.starts_with("agent-") {
                     continue;
                 }
-                let (summary, custom_title, cwd, created_at) = if let Ok(file) = File::open(path) {
+                let (summary, custom_title, cwd, created_at, has_conversation_data) = if let Ok(file) = File::open(path) {
                     let reader = BufReader::new(file);
                     let mut summary: Option<String> = None;
                     let mut custom_title: Option<String> = None;
                     let mut cwd = None;
                     let mut created_at = None;
+                    let mut has_conversation_data = false;
 
                     for line_str in reader.lines().map_while(std::result::Result::ok) {
                         if let Ok(v) = serde_json::from_str::<Value>(&line_str) {
+                            if v.get("message").is_some()
+                                || v.get("role").is_some()
+                                || v.get("content").is_some()
+                                || v.get("toolUseResult").is_some()
+                            {
+                                has_conversation_data = true;
+                            }
                             if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
                                 if t == "summary" && summary.is_none() {
                                     summary = v
@@ -264,6 +272,17 @@ impl ChatReader {
                                         .get("customTitle")
                                         .and_then(|x| x.as_str())
                                         .map(|s| s.to_string());
+                                }
+                                if matches!(
+                                    t,
+                                    "user"
+                                        | "assistant"
+                                        | "message_start"
+                                        | "message_stop"
+                                        | "content_block_start"
+                                        | "content_block_delta"
+                                ) {
+                                    has_conversation_data = true;
                                 }
                             }
 
@@ -278,10 +297,20 @@ impl ChatReader {
                             }
                         }
                     }
-                    (summary, custom_title, cwd, created_at)
+                    (summary, custom_title, cwd, created_at, has_conversation_data)
                 } else {
-                    (None, None, None, None)
+                    (None, None, None, None, false)
                 };
+
+                // Ignore empty/corrupt stub files that don't contain conversation content.
+                if !has_conversation_data
+                    && summary.is_none()
+                    && custom_title.is_none()
+                    && cwd.is_none()
+                    && created_at.is_none()
+                {
+                    continue;
+                }
                 list.push(ConversationMeta {
                     id,
                     path: cwd,
@@ -757,8 +786,9 @@ pub fn sort_conversations_by_earliest(convos: &mut [ConversationMeta]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
-    use tempfile::Builder;
+    use tempfile::{Builder, TempDir};
 
     fn write_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
         let mut file = Builder::new()
@@ -791,6 +821,38 @@ mod tests {
         assert_eq!(
             assistant_msgs[0].content.trim(),
             "There are currently no Skills available."
+        );
+    }
+
+    #[test]
+    fn list_conversations_skips_empty_stub_files() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let project_dir = temp_dir.path().join("project-a");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+
+        fs::write(project_dir.join("empty.jsonl"), "").expect("write empty file");
+        fs::write(project_dir.join("junk.jsonl"), "not-json\n").expect("write junk file");
+        fs::write(
+            project_dir.join("valid.jsonl"),
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+        )
+        .expect("write valid file");
+
+        let reader = ChatReader::with_projects_dir(temp_dir.path().to_path_buf());
+        let conversations = reader.list_conversations().expect("list conversations");
+        let ids: Vec<String> = conversations.iter().map(|c| c.id.clone()).collect();
+
+        assert!(
+            ids.contains(&"valid".to_string()),
+            "expected valid conversation to be listed"
+        );
+        assert!(
+            !ids.contains(&"empty".to_string()),
+            "expected empty stub to be skipped"
+        );
+        assert!(
+            !ids.contains(&"junk".to_string()),
+            "expected corrupt stub to be skipped"
         );
     }
 }
