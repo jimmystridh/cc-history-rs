@@ -353,12 +353,18 @@ impl ChatReader {
     }
 
     pub fn parse_conversation_file(path: &Path) -> Result<(ConversationMeta, Vec<Message>)> {
+        Self::parse_conversation_reader(path, BufReader::new(File::open(path)?))
+    }
+
+    pub fn parse_conversation_reader<R: BufRead>(
+        path: &Path,
+        reader: R,
+    ) -> Result<(ConversationMeta, Vec<Message>)> {
         let id = path
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| HistoryError::InvalidPath(path.to_path_buf()))?
             .to_string();
-        let f = File::open(path)?;
         let mut msgs = Vec::new();
         let mut summary: Option<String> = None;
         let mut custom_title: Option<String> = None;
@@ -385,7 +391,7 @@ impl ChatReader {
         let mut stream_buf = String::new();
         let mut streaming = false;
 
-        for line in BufReader::new(f).lines() {
+        for line in reader.lines() {
             let line = line?;
             let v: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,

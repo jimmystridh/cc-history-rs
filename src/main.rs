@@ -4248,21 +4248,17 @@ fn spawn_list_search(app: &mut App) {
     let (tx, rx) = mpsc::channel();
     app.list_search_rx = Some(rx);
     app.list_search_in_progress = true;
-    let query = app.list_search_query.to_lowercase();
+    let query = app.list_search_query.clone();
     let all_rows = app.all_rows.clone();
     thread::spawn(move || {
-        let reader = ChatReader::new();
-        let mut results: Vec<RowItem> = Vec::new();
-        for r in all_rows.into_iter() {
-            if let Ok((_, msgs)) = reader.get_messages_by_id(&r.id) {
-                if msgs
-                    .iter()
-                    .any(|m| m.content.to_lowercase().contains(&query))
-                {
-                    results.push(r);
-                }
-            }
-        }
+        let files: Vec<&str> = all_rows.iter().map(|r| r.file_path.as_str()).collect();
+        let hits = cc_history_lib::search_sessions(&files, &query);
+        let results: Vec<RowItem> = all_rows
+            .iter()
+            .zip(hits)
+            .filter(|(_, hit)| *hit)
+            .map(|(row, _)| row.clone())
+            .collect();
         let _ = tx.send(results);
     });
 }

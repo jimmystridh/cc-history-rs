@@ -20,6 +20,7 @@ pub mod error;
 pub mod index;
 pub mod paths;
 pub mod reader;
+pub mod search;
 pub mod writer;
 
 pub use error::{HistoryError, Result};
@@ -30,6 +31,7 @@ pub use paths::{archive_root_dir, compute_relative_path, encode_path_to_dir_name
 pub use reader::{
     short_path, sort_conversations_by_earliest, ChatReader, ConversationMeta, Message,
 };
+pub use search::{search_sessions, SessionSearcher};
 pub use writer::{
     archive_session, duplicate_session, generate_uuid, rename_session, repath_session,
     unarchive_session, SessionAction,
