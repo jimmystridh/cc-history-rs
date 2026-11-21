@@ -212,6 +212,20 @@ enum SortKey {
     LastMsg,
 }
 
+fn time_column_label(sort_key: SortKey) -> &'static str {
+    match sort_key {
+        SortKey::Created | SortKey::Path => "Created",
+        SortKey::LastMsg => "Last Msg",
+    }
+}
+
+fn row_time_ms(row: &RowItem, sort_key: SortKey) -> i64 {
+    match sort_key {
+        SortKey::LastMsg => row.last_msg_ms.unwrap_or(row.date_ms),
+        SortKey::Created | SortKey::Path => row.date_ms,
+    }
+}
+
 impl App {
     fn new_with_projects(projects_dir: PathBuf) -> Result<Self> {
         let reader = ChatReader::with_projects_dir(projects_dir.clone());
@@ -510,10 +524,10 @@ impl App {
                 continue;
             }
 
-            // Find newest conversation for preview
+            // Find newest conversation for preview based on active time column semantics.
             let newest = convos
                 .iter()
-                .max_by_key(|c| c.date_ms)
+                .max_by_key(|c| row_time_ms(c, self.sort_key))
                 .cloned()
                 .unwrap_or_else(|| convos[0].clone());
 
@@ -521,7 +535,7 @@ impl App {
             self.display_rows.push(DisplayRow::Group {
                 path: path.clone(),
                 count: convos.len(),
-                newest_date_ms: newest.date_ms,
+                newest_date_ms: row_time_ms(&newest, self.sort_key),
                 newest_preview: newest.first_msg.clone(),
             });
 
@@ -1199,7 +1213,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
     // Aligned header matching the computed column widths
     let header_text = format!(
         "{} │ {} │ {}",
-        pad("Time", date_w),
+        pad(time_column_label(app.sort_key), date_w),
         pad("CWD", path_w),
         pad("First Message", msg_w)
     );
@@ -1262,7 +1276,7 @@ fn render_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
                     Row::new(cells).style(style)
                 }
                 DisplayRow::Conversation(r) => {
-                    let date = format_time(r.date_ms);
+                    let date = format_time(row_time_ms(r, app.sort_key));
                     let cwd_raw = cc_history_lib::short_path(&r.path);
                     // Indent conversations under groups
                     let cwd_display = if app.grouped_mode {
